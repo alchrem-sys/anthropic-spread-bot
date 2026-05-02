@@ -56,16 +56,31 @@ REQUIRED_CHANNEL = "@l1xosha"   # users must be subscribed to this channel
 
 async def _gate_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Runs before every handler (group -1). Blocks non-subscribers."""
+    from telegram.error import BadRequest as TGBadRequest, NetworkError
+
     user = update.effective_user
     if user is None:
         raise ApplicationHandlerStop
+
+    blocked = False
     try:
         member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user.id)
+        # "left" = was member but left; "kicked"/"banned" = removed
         if member.status in ("left", "kicked", "banned"):
-            raise PermissionError
+            blocked = True
     except ApplicationHandlerStop:
         raise
-    except PermissionError:
+    except TGBadRequest:
+        # User was NEVER in the channel → Telegram returns 400 Bad Request
+        blocked = True
+    except NetworkError:
+        # Temporary network issue → fail-open (don't lock out real users)
+        blocked = False
+    except Exception:
+        # Unknown error → fail-open
+        blocked = False
+
+    if blocked:
         if update.message:
             await update.message.reply_text(
                 f"🔒 Бот доступний лише для підписників каналу {REQUIRED_CHANNEL}\n\n"
@@ -73,12 +88,9 @@ async def _gate_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         elif update.callback_query:
             await update.callback_query.answer(
-                f"🔒 Підпишись на {REQUIRED_CHANNEL} для доступу", show_alert=True
+                f"🔒 Підпишись на {REQUIRED_CHANNEL}", show_alert=True
             )
         raise ApplicationHandlerStop
-    except Exception:
-        # Can't check (e.g. network error) — allow through to avoid false lockouts
-        pass
 
 ASK_LEG_A_EX, ASK_LEG_A_SYM, ASK_LEG_B_EX, ASK_LEG_B_SYM = range(4)
 
