@@ -213,7 +213,7 @@ class SpreadConfig:
     leg_a: ExchangeInfo
     leg_b: ExchangeInfo
     in_threshold: float = 0.3
-    out_threshold: float = 0.3
+    out_threshold: float = -0.2
     out_max_threshold: float = 20.0
     oi_threshold: float = 6_900_000.0
     out_min_depth: float = 0.5
@@ -256,7 +256,7 @@ class SpreadConfig:
         return cls(
             spread_id=spread_id, leg_a=leg_a, leg_b=leg_b,
             in_threshold=float(h.get("in_threshold", 0.3)),
-            out_threshold=float(h.get("out_threshold", 0.3)),
+            out_threshold=float(h.get("out_threshold", -0.2)),
             out_max_threshold=float(h.get("out_max_threshold", 20.0)),
             oi_threshold=float(h.get("oi_threshold", 6_900_000.0)),
             out_min_depth=float(h.get("out_min_depth", 0.5)),
@@ -384,13 +384,7 @@ class SpreadBot:
                 await self.feed.subscribe(cfg.leg_a)
                 await self.feed.subscribe(cfg.leg_b)
         log.info("hydrated %d chats, %d spreads", len(chat_ids), len(self._spreads))
-        # restart notification
-        if self._app:
-            for cid in chat_ids:
-                try:
-                    await self._app.bot.send_message(cid, "🔄 Bot restarted — monitoring resumed.")
-                except Exception:
-                    pass
+        # restart notification intentionally removed — too noisy
 
     @property
     def store(self) -> RedisStore:
@@ -648,10 +642,12 @@ class SpreadBot:
                 try:
                     delta = float(delta_s)
                     if kind == "adj_in":
+                        # IN is always >= 0 (entry only makes sense on positive spread)
                         cfg.in_threshold = max(0.0, round(cfg.in_threshold + delta, 3))
                         await self.store.update_field(sid, "in_threshold", str(cfg.in_threshold))
                     else:
-                        cfg.out_threshold = max(0.0, round(cfg.out_threshold + delta, 3))
+                        # OUT can go negative (exit at a loss is normal, e.g. -0.2 to -1.0)
+                        cfg.out_threshold = round(cfg.out_threshold + delta, 3)
                         await self.store.update_field(sid, "out_threshold", str(cfg.out_threshold))
                     await self._show_detail(q, cid, cfg)
                 except Exception:
