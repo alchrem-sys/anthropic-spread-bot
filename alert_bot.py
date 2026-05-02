@@ -37,6 +37,8 @@ log = logging.getLogger("alert_bot")
 
 DEFAULT_IN_THRESHOLD = 0.3
 DEFAULT_OUT_THRESHOLD = 0.3
+DEFAULT_OUT_MAX_THRESHOLD = 20.0
+DEFAULT_OI_THRESHOLD = 6_900_000.0
 ALERT_POLL_INTERVAL_S = 1.0
 ALERT_REFIRE_INTERVAL_S = 3.0  # spam cadence while breached
 
@@ -49,6 +51,8 @@ class ChatConfig:
     chat_id: int
     in_threshold: float = DEFAULT_IN_THRESHOLD
     out_threshold: float = DEFAULT_OUT_THRESHOLD
+    out_max_threshold: float = DEFAULT_OUT_MAX_THRESHOLD
+    oi_threshold: float = DEFAULT_OI_THRESHOLD
     alerts_on: bool = True
 
 
@@ -88,6 +92,8 @@ class JsonConfigStore(ConfigStore):
                     chat_id=cid,
                     in_threshold=float(v.get("in_threshold", DEFAULT_IN_THRESHOLD)),
                     out_threshold=float(v.get("out_threshold", DEFAULT_OUT_THRESHOLD)),
+                    out_max_threshold=float(v.get("out_max_threshold", DEFAULT_OUT_MAX_THRESHOLD)),
+                    oi_threshold=float(v.get("oi_threshold", DEFAULT_OI_THRESHOLD)),
                     alerts_on=bool(v.get("alerts_on", True)),
                 )
             except (TypeError, ValueError):
@@ -109,6 +115,8 @@ class JsonConfigStore(ConfigStore):
         data.setdefault("chats", {})[str(cfg.chat_id)] = {
             "in_threshold": cfg.in_threshold,
             "out_threshold": cfg.out_threshold,
+            "out_max_threshold": cfg.out_max_threshold,
+            "oi_threshold": cfg.oi_threshold,
             "alerts_on": cfg.alerts_on,
         }
         tmp = self.path + ".tmp"
@@ -146,6 +154,8 @@ class RedisConfigStore(ConfigStore):
                 chat_id=cid,
                 in_threshold=float(data.get("in_threshold", DEFAULT_IN_THRESHOLD)),
                 out_threshold=float(data.get("out_threshold", DEFAULT_OUT_THRESHOLD)),
+                out_max_threshold=float(data.get("out_max_threshold", DEFAULT_OUT_MAX_THRESHOLD)),
+                oi_threshold=float(data.get("oi_threshold", DEFAULT_OI_THRESHOLD)),
                 alerts_on=data.get("alerts_on", "1") not in ("0", "false", "False"),
             )
         return out
@@ -157,6 +167,8 @@ class RedisConfigStore(ConfigStore):
             mapping={
                 "in_threshold": str(cfg.in_threshold),
                 "out_threshold": str(cfg.out_threshold),
+                "out_max_threshold": str(cfg.out_max_threshold),
+                "oi_threshold": str(cfg.oi_threshold),
                 "alerts_on": "1" if cfg.alerts_on else "0",
             },
         )
@@ -193,6 +205,8 @@ class ChatRuntime:
     cfg: ChatConfig
     in_state: AlertChannelState = field(default_factory=AlertChannelState)
     out_state: AlertChannelState = field(default_factory=AlertChannelState)
+    out_max_state: AlertChannelState = field(default_factory=AlertChannelState)
+    oi_state: AlertChannelState = field(default_factory=AlertChannelState)
 
 
 class BotState:
@@ -276,6 +290,35 @@ def fmt_out_alert(snap: dict) -> str:
     )
 
 
+def _fmt_oi(v: Optional[float]) -> str:
+    if v is None:
+        return "--"
+    return f"${v / 1_000_000:.3f}M"
+
+
+def fmt_out_max_alert(snap: dict) -> str:
+    g = snap["gate"]
+    h = snap["hl"]
+    return (
+        "🔴🔴 OUT SPREAD EXTREME — ANTHROPIC\n"
+        f"📉 OUT Spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})\n"
+        f"HL bid: {_fmt_price(h['bid'])} | Gate ask: {_fmt_price(g['ask'])}\n"
+        f"Fund diff: Gate {_fmt_funding(g['funding'])} / HL {_fmt_funding(h['funding'])}\n"
+        f"⏰ {_now_utc_str()}"
+    )
+
+
+def fmt_oi_alert(snap: dict, threshold: float) -> str:
+    h = snap["hl"]
+    oi_usd = snap["hl_oi_usd"]
+    return (
+        "📊 OI LIMIT ALERT — ANTHROPIC\n"
+        f"HL OI: {_fmt_oi(oi_usd)} ≥ threshold {_fmt_oi(threshold)}\n"
+        f"HL mark: {_fmt_price(h.get('mark_px'))} | OI coins: {h.get('oi', '--')}\n"
+        f"⏰ {_now_utc_str()}"
+    )
+
+
 def fmt_status(snap: dict, cfg: ChatConfig) -> str:
     g = snap["gate"]
     h = snap["hl"]
@@ -284,11 +327,13 @@ def fmt_status(snap: dict, cfg: ChatConfig) -> str:
         f"Gate.io  bid={_fmt_price(g['bid'])} ask={_fmt_price(g['ask'])} "
         f"fund={_fmt_funding(g['funding'])} {'STALE' if snap['gate_stale'] else 'LIVE'}\n"
         f"HyperLiq bid={_fmt_price(h['bid'])} ask={_fmt_price(h['ask'])} "
-        f"fund={_fmt_funding(h['funding'])} {'STALE' if snap['hl_stale'] else 'LIVE'}\n"
+        f"fund={_fmt_funding(h['funding'])} OI={_fmt_oi(snap.get('hl_oi_usd'))} "
+        f"{'STALE' if snap['hl_stale'] else 'LIVE'}\n"
         f"\nIN  spread: {_fmt_pct(snap['in_spread_pct'])} ({_fmt_usd(snap['in_spread_usd'])})  "
         f"thr={cfg.in_threshold:.3f}%\n"
         f"OUT spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})  "
-        f"thr={cfg.out_threshold:.3f}%\n"
+        f"thr={cfg.out_threshold:.3f}% / max={cfg.out_max_threshold:.3f}%\n"
+        f"OI threshold: {_fmt_oi(cfg.oi_threshold)}\n"
         f"alerts: {'ON' if cfg.alerts_on else 'OFF'}"
     )
 
@@ -311,8 +356,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 ANTHROPIC spread alert bot connected.\n\n"
         f"IN  threshold: {rt.cfg.in_threshold:.3f}%\n"
         f"OUT threshold: {rt.cfg.out_threshold:.3f}%\n"
+        f"OUT max threshold: {rt.cfg.out_max_threshold:.3f}%\n"
+        f"OI threshold: {_fmt_oi(rt.cfg.oi_threshold)}\n"
         f"Alerts: {'ON' if rt.cfg.alerts_on else 'OFF'}\n\n"
-        "Commands: /status /set_in /set_out /thresholds /alerts_on /alerts_off /help"
+        "Commands: /status /set_in /set_out /set_outmax /set_oi /thresholds /alerts_on /alerts_off /help"
     )
 
 
@@ -322,10 +369,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_chat.send_message(
         "Commands:\n"
         "/start — register and show thresholds\n"
-        "/status — live spread snapshot\n"
+        "/status — live spread + OI snapshot\n"
         "/set_in <pct> — set IN spread alert threshold (e.g. /set_in 0.5)\n"
-        "/set_out <pct> — set OUT spread alert threshold\n"
-        "/thresholds — show current thresholds\n"
+        "/set_out <pct> — set OUT spread lower threshold\n"
+        "/set_outmax <pct> — set OUT spread upper threshold (e.g. /set_outmax 20)\n"
+        "/set_oi <millions> — set OI alert threshold in $M (e.g. /set_oi 6.9)\n"
+        "/thresholds — show all thresholds\n"
         "/alerts_on — enable alerts in this chat\n"
         "/alerts_off — disable alerts in this chat\n"
         "/help — this message"
@@ -344,7 +393,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_chat.send_message(fmt_status(snap, rt.cfg))
 
 
-async def _set_threshold(
+async def _set_pct_threshold(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, kind: str
 ) -> None:
     if update.effective_chat is None:
@@ -352,8 +401,9 @@ async def _set_threshold(
     bd = _bot_data(ctx)
     state: BotState = bd["state"]
     store: ConfigStore = bd["store"]
+    cmd = {"IN": "set_in", "OUT": "set_out", "OUT_MAX": "set_outmax"}[kind]
     if not ctx.args:
-        await update.effective_chat.send_message(f"Usage: /set_{kind.lower()} <pct>")
+        await update.effective_chat.send_message(f"Usage: /{cmd} <pct>")
         return
     try:
         val = float(ctx.args[0])
@@ -363,18 +413,45 @@ async def _set_threshold(
     rt = await state.get_or_create(store, update.effective_chat.id)
     if kind == "IN":
         rt.cfg.in_threshold = val
-    else:
+    elif kind == "OUT":
         rt.cfg.out_threshold = val
+    else:
+        rt.cfg.out_max_threshold = val
     await store.upsert(rt.cfg)
-    await update.effective_chat.send_message(f"{kind} threshold set to {val:.3f}%")
+    label = {"IN": "IN", "OUT": "OUT", "OUT_MAX": "OUT max"}[kind]
+    await update.effective_chat.send_message(f"{label} threshold set to {val:.3f}%")
 
 
 async def cmd_set_in(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_threshold(update, ctx, "IN")
+    await _set_pct_threshold(update, ctx, "IN")
 
 
 async def cmd_set_out(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_threshold(update, ctx, "OUT")
+    await _set_pct_threshold(update, ctx, "OUT")
+
+
+async def cmd_set_outmax(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_pct_threshold(update, ctx, "OUT_MAX")
+
+
+async def cmd_set_oi(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None:
+        return
+    bd = _bot_data(ctx)
+    state: BotState = bd["state"]
+    store: ConfigStore = bd["store"]
+    if not ctx.args:
+        await update.effective_chat.send_message("Usage: /set_oi <millions>  (e.g. /set_oi 6.9)")
+        return
+    try:
+        val = float(ctx.args[0]) * 1_000_000
+    except ValueError:
+        await update.effective_chat.send_message("Could not parse number.")
+        return
+    rt = await state.get_or_create(store, update.effective_chat.id)
+    rt.cfg.oi_threshold = val
+    await store.upsert(rt.cfg)
+    await update.effective_chat.send_message(f"OI threshold set to {_fmt_oi(val)}")
 
 
 async def cmd_thresholds(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -386,7 +463,9 @@ async def cmd_thresholds(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     rt = await state.get_or_create(store, update.effective_chat.id)
     await update.effective_chat.send_message(
         f"IN  threshold: {rt.cfg.in_threshold:.3f}%\n"
-        f"OUT threshold: {rt.cfg.out_threshold:.3f}%"
+        f"OUT threshold: {rt.cfg.out_threshold:.3f}%\n"
+        f"OUT max threshold: {rt.cfg.out_max_threshold:.3f}%\n"
+        f"OI threshold: {_fmt_oi(rt.cfg.oi_threshold)}"
     )
 
 
@@ -448,6 +527,7 @@ async def alert_dispatcher(app: Application, feed: PriceFeed, state: BotState) -
 
         in_pct = snap["in_spread_pct"]
         out_pct = snap["out_spread_pct"]
+        oi_usd = snap.get("hl_oi_usd")
         now = time.monotonic()
 
         async with state.lock:
@@ -455,31 +535,53 @@ async def alert_dispatcher(app: Application, feed: PriceFeed, state: BotState) -
 
         for rt in chats:
             if not rt.cfg.alerts_on:
-                rt.in_state.breached = False
-                rt.out_state.breached = False
+                for s in (rt.in_state, rt.out_state, rt.out_max_state, rt.oi_state):
+                    s.breached = False
                 continue
 
+            # IN spread
             if in_pct is not None and in_pct >= rt.cfg.in_threshold:
                 rt.in_state.breached = True
                 if now - rt.in_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
                     rt.in_state.last_fired = now
-                    main = fmt_in_alert(snap)
-                    follow = f"🚨 STILL ACTIVE — IN {_fmt_pct(in_pct)} ≥ thr {rt.cfg.in_threshold:.3f}%"
-                    await _safe_send(bot, rt.cfg.chat_id, main)
-                    await _safe_send(bot, rt.cfg.chat_id, follow)
+                    await _safe_send(bot, rt.cfg.chat_id, fmt_in_alert(snap))
+                    await _safe_send(bot, rt.cfg.chat_id,
+                        f"🚨 STILL ACTIVE — IN {_fmt_pct(in_pct)} ≥ thr {rt.cfg.in_threshold:.3f}%")
             else:
                 rt.in_state.breached = False
 
+            # OUT spread (lower threshold)
             if out_pct is not None and out_pct >= rt.cfg.out_threshold:
                 rt.out_state.breached = True
                 if now - rt.out_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
                     rt.out_state.last_fired = now
-                    main = fmt_out_alert(snap)
-                    follow = f"🚨 STILL ACTIVE — OUT {_fmt_pct(out_pct)} ≥ thr {rt.cfg.out_threshold:.3f}%"
-                    await _safe_send(bot, rt.cfg.chat_id, main)
-                    await _safe_send(bot, rt.cfg.chat_id, follow)
+                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_alert(snap))
+                    await _safe_send(bot, rt.cfg.chat_id,
+                        f"🚨 STILL ACTIVE — OUT {_fmt_pct(out_pct)} ≥ thr {rt.cfg.out_threshold:.3f}%")
             else:
                 rt.out_state.breached = False
+
+            # OUT spread (upper / extreme threshold)
+            if out_pct is not None and out_pct >= rt.cfg.out_max_threshold:
+                rt.out_max_state.breached = True
+                if now - rt.out_max_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
+                    rt.out_max_state.last_fired = now
+                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_max_alert(snap))
+                    await _safe_send(bot, rt.cfg.chat_id,
+                        f"🚨🚨 EXTREME OUT — {_fmt_pct(out_pct)} ≥ max {rt.cfg.out_max_threshold:.3f}%")
+            else:
+                rt.out_max_state.breached = False
+
+            # OI threshold
+            if oi_usd is not None and oi_usd >= rt.cfg.oi_threshold:
+                rt.oi_state.breached = True
+                if now - rt.oi_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
+                    rt.oi_state.last_fired = now
+                    await _safe_send(bot, rt.cfg.chat_id, fmt_oi_alert(snap, rt.cfg.oi_threshold))
+                    await _safe_send(bot, rt.cfg.chat_id,
+                        f"🚨 OI STILL HIGH — {_fmt_oi(oi_usd)} ≥ {_fmt_oi(rt.cfg.oi_threshold)}")
+            else:
+                rt.oi_state.breached = False
 
         await asyncio.sleep(ALERT_POLL_INTERVAL_S)
 
@@ -544,6 +646,8 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("set_in", cmd_set_in))
     app.add_handler(CommandHandler("set_out", cmd_set_out))
+    app.add_handler(CommandHandler("set_outmax", cmd_set_outmax))
+    app.add_handler(CommandHandler("set_oi", cmd_set_oi))
     app.add_handler(CommandHandler("thresholds", cmd_thresholds))
     app.add_handler(CommandHandler("alerts_on", cmd_alerts_on))
     app.add_handler(CommandHandler("alerts_off", cmd_alerts_off))

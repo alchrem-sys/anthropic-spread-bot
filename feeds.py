@@ -44,7 +44,7 @@ class PriceFeed:
         self._lock = asyncio.Lock()
         self._prices: dict[str, dict[str, Any]] = {
             "gate": {"bid": None, "ask": None, "funding": None, "ts": None},
-            "hl": {"bid": None, "ask": None, "funding": None, "ts": None},
+            "hl": {"bid": None, "ask": None, "funding": None, "oi": None, "mark_px": None, "ts": None},
         }
         self._tasks: list[asyncio.Task] = []
         self._session: Optional[aiohttp.ClientSession] = None
@@ -102,6 +102,9 @@ class PriceFeed:
         if hl["bid"] is not None and gate["ask"] is not None and gate["ask"] > 0:
             snap["out_spread_usd"] = hl["bid"] - gate["ask"]
             snap["out_spread_pct"] = (hl["bid"] - gate["ask"]) / gate["ask"] * 100.0
+        oi = hl.get("oi")
+        mark = hl.get("mark_px")
+        snap["hl_oi_usd"] = float(oi) * float(mark) if oi is not None and mark is not None else None
         return snap
 
     async def _set(
@@ -111,6 +114,8 @@ class PriceFeed:
         bid: Optional[float] = None,
         ask: Optional[float] = None,
         funding: Optional[float] = None,
+        oi: Optional[float] = None,
+        mark_px: Optional[float] = None,
         touch_ts: bool = True,
     ) -> None:
         async with self._lock:
@@ -121,6 +126,10 @@ class PriceFeed:
                 p["ask"] = ask
             if funding is not None:
                 p["funding"] = funding
+            if oi is not None:
+                p["oi"] = oi
+            if mark_px is not None:
+                p["mark_px"] = mark_px
             if touch_ts and (bid is not None or ask is not None):
                 p["ts"] = time.monotonic()
 
@@ -263,12 +272,21 @@ class PriceFeed:
                         None,
                     )
                     if idx is not None and idx < len(ctxs):
-                        fr = ctxs[idx].get("funding") if isinstance(ctxs[idx], dict) else None
-                        if fr is not None:
-                            try:
-                                await self._set("hl", funding=float(fr), touch_ts=False)
-                            except (TypeError, ValueError):
-                                pass
+                        ctx = ctxs[idx] if isinstance(ctxs[idx], dict) else {}
+                        fr = ctx.get("funding")
+                        oi_raw = ctx.get("openInterest")
+                        mark_raw = ctx.get("markPx")
+                        kw: dict[str, Any] = {"touch_ts": False}
+                        try:
+                            if fr is not None:
+                                kw["funding"] = float(fr)
+                            if oi_raw is not None:
+                                kw["oi"] = float(oi_raw)
+                            if mark_raw is not None:
+                                kw["mark_px"] = float(mark_raw)
+                            await self._set("hl", **kw)
+                        except (TypeError, ValueError):
+                            pass
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -350,7 +368,7 @@ class PriceFeed:
                     f"gate bid={snap['gate']['bid']} ask={snap['gate']['ask']} "
                     f"fund={snap['gate']['funding']} stale={snap['gate_stale']} | "
                     f"hl bid={snap['hl']['bid']} ask={snap['hl']['ask']} "
-                    f"fund={snap['hl']['funding']} stale={snap['hl_stale']} | "
+                    f"fund={snap['hl']['funding']} oi_usd={snap['hl_oi_usd']} stale={snap['hl_stale']} | "
                     f"in={snap['in_spread_pct']} out={snap['out_spread_pct']}"
                 )
         finally:
