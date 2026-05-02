@@ -178,33 +178,50 @@ class RedisStore:
 # ─────────────────────────────────────────── bot
 
 class SpreadBot:
-    def __init__(self, token: str, store: RedisStore, feed: FeedManager) -> None:
+    def __init__(self, token: str) -> None:
         self._token = token
-        self._store = store
-        self._feed = feed
+        self._store: Optional[RedisStore] = None
+        self._feed:  Optional[FeedManager] = None
+        self._session: Optional[aiohttp.ClientSession] = None
         self._app: Optional[Application] = None
         self._runtimes:    dict[int, ChatRuntime]   = {}
-        self._spreads:     dict[str, SpreadConfig]  = {}   # sid -> cfg (global)
-        self._chat_spreads:dict[int, list[str]]     = {}   # cid -> [sid]
-        self._conv_a:      dict[int, ExchangeInfo]  = {}   # temp conv state
+        self._spreads:     dict[str, SpreadConfig]  = {}
+        self._chat_spreads:dict[int, list[str]]     = {}
+        self._conv_a:      dict[int, ExchangeInfo]  = {}
 
     async def _post_init(self, app: Application) -> None:
         self._app = app
+
+        redis_url = os.getenv("REDIS_URL", "").strip()
+        if not redis_url:
+            raise SystemExit("REDIS_URL not set")
+        try:
+            rc = redis_from_url(redis_url, decode_responses=True)
+            await rc.ping()
+        except Exception as e:
+            raise SystemExit(f"Redis error: {e}") from e
+
+        self._store = RedisStore(rc)
+        self._session = aiohttp.ClientSession()
+        self._feed = FeedManager()
+        await self._feed.start(self._session)
+
         await self._hydrate()
         asyncio.create_task(self._dispatch_loop())
 
     async def _hydrate(self) -> None:
-        chat_ids = await self._store.all_chat_ids()
+        assert self._store is not None and self._feed is not None
+        chat_ids = await self.store.all_chat_ids()
         for cid in chat_ids:
             rt = ChatRuntime(chat_id=cid)
-            rt.selected_spread_id = await self._store.get_selected_spread(cid)
+            rt.selected_spread_id = await self.store.get_selected_spread(cid)
             self._runtimes[cid] = rt
-            spreads = await self._store.load_spreads(cid)
+            spreads = await self.store.load_spreads(cid)
             self._chat_spreads[cid] = [s.spread_id for s in spreads]
             for cfg in spreads:
                 self._spreads[cfg.spread_id] = cfg
-                await self._feed.subscribe(cfg.leg_a)
-                await self._feed.subscribe(cfg.leg_b)
+                await self.feed.subscribe(cfg.leg_a)
+                await self.feed.subscribe(cfg.leg_b)
         log.info("hydrated %d chats, %d spreads", len(chat_ids), len(self._spreads))
         # restart notification
         if self._app:
@@ -213,6 +230,16 @@ class SpreadBot:
                     await self._app.bot.send_message(cid, "🔄 Bot restarted — monitoring resumed.")
                 except Exception:
                     pass
+
+    @property
+    def store(self) -> RedisStore:
+        assert self._store is not None, "store not initialised"
+        return self._store
+
+    @property
+    def feed(self) -> FeedManager:
+        assert self._feed is not None, "feed not initialised"
+        return self._feed
 
     def _rt(self, cid: int) -> ChatRuntime:
         if cid not in self._runtimes:
@@ -234,7 +261,7 @@ class SpreadBot:
 
     async def cmd_start(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         cid = u.effective_chat.id
-        await self._store.register_chat(cid)
+        await self.store.register_chat(cid)
         self._runtimes.setdefault(cid, ChatRuntime(chat_id=cid))
         self._chat_spreads.setdefault(cid, [])
         await u.message.reply_text(
@@ -294,15 +321,15 @@ class SpreadBot:
 
         sid = str(uuid.uuid4())[:8]
         cfg = SpreadConfig(spread_id=sid, leg_a=info_a, leg_b=info_b)
-        await self._store.register_chat(cid)
-        await self._store.save_spread(cid, cfg)
+        await self.store.register_chat(cid)
+        await self.store.save_spread(cid, cfg)
         self._spreads[sid] = cfg
         self._chat_spreads.setdefault(cid, []).append(sid)
-        await self._feed.subscribe(info_a)
-        await self._feed.subscribe(info_b)
+        await self.feed.subscribe(info_a)
+        await self.feed.subscribe(info_b)
         rt = self._rt(cid)
         rt.selected_spread_id = sid
-        await self._store.set_selected_spread(cid, sid)
+        await self.store.set_selected_spread(cid, sid)
         await u.message.reply_text(
             f"✅ Spread added!\n*{cfg.name}*\n\n"
             f"Thresholds: IN {cfg.in_threshold}% | OUT {cfg.out_threshold}%\n"
@@ -353,11 +380,11 @@ class SpreadBot:
                 return
             rt = self._rt(cid)
             rt.selected_spread_id = sid
-            await self._store.set_selected_spread(cid, sid)
+            await self.store.set_selected_spread(cid, sid)
             await self._show_detail(q, cid, cfg)
         elif data.startswith("del:"):
             sid = data[4:]
-            await self._store.delete_spread(cid, sid)
+            await self.store.delete_spread(cid, sid)
             self._spreads.pop(sid, None)
             ids = self._chat_spreads.get(cid, [])
             if sid in ids:
@@ -371,15 +398,15 @@ class SpreadBot:
             cfg = self._spreads.get(sid)
             if cfg:
                 cfg.alerts_on = not cfg.alerts_on
-                await self._store.update_field(sid, "alerts_on", "1" if cfg.alerts_on else "0")
+                await self.store.update_field(sid, "alerts_on", "1" if cfg.alerts_on else "0")
                 await self._show_detail(q, cid, cfg)
         elif data.startswith("terminal:"):
             sid = data[9:]
-            await self._store.set_monitor_spread(sid)
+            await self.store.set_monitor_spread(sid)
             await q.answer("📺 Terminal synced!", show_alert=False)
 
     async def _show_detail(self, q, cid: int, cfg: SpreadConfig) -> None:
-        ss = self._feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
+        ss = self.feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
         in_s  = f"{ss.in_spread_pct:+.3f}%"  if ss.in_spread_pct  is not None else "N/A"
         out_s = f"{ss.out_spread_pct:+.3f}%" if ss.out_spread_pct is not None else "N/A"
         alerts = "ON ✅" if cfg.alerts_on else "OFF 🔇"
@@ -409,7 +436,7 @@ class SpreadBot:
         if cfg is None:
             await u.message.reply_text("No spread selected. Use /newspread first.")
             return
-        ss = self._feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
+        ss = self.feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
         await u.message.reply_text(_fmt_status(cfg, ss), parse_mode=ParseMode.MARKDOWN)
 
     # ─── threshold setters
@@ -430,7 +457,7 @@ class SpreadBot:
             await u.message.reply_text(f"Invalid: {c.args[0]}")
             return
         setattr(cfg, attr, val)
-        await self._store.update_field(cfg.spread_id, attr, str(val))
+        await self.store.update_field(cfg.spread_id, attr, str(val))
         await u.message.reply_text(f"✅ {label} = {val}")
 
     async def cmd_set_in(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -471,7 +498,7 @@ class SpreadBot:
             await u.message.reply_text("No spread selected.")
             return
         cfg.alerts_on = True
-        await self._store.update_field(cfg.spread_id, "alerts_on", "1")
+        await self.store.update_field(cfg.spread_id, "alerts_on", "1")
         await u.message.reply_text("✅ Alerts ON")
 
     async def cmd_alerts_off(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -481,7 +508,7 @@ class SpreadBot:
             await u.message.reply_text("No spread selected.")
             return
         cfg.alerts_on = False
-        await self._store.update_field(cfg.spread_id, "alerts_on", "0")
+        await self.store.update_field(cfg.spread_id, "alerts_on", "0")
         await u.message.reply_text("🔇 Alerts OFF")
 
     # ─── dispatcher
@@ -497,7 +524,7 @@ class SpreadBot:
                     if not cfg or not cfg.alerts_on:
                         continue
                     try:
-                        ss = self._feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
+                        ss = self.feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
                         await self._check(bot, cid, cfg, ss, rt, now)
                     except Exception as e:
                         log.debug("dispatch err cid=%s sid=%s: %s", cid, sid, e)
@@ -632,27 +659,13 @@ async def _safe_send(bot, cid, text) -> None:
 
 # ─────────────────────────────────────────── entry point
 
-async def main() -> None:
+def main() -> None:
+    """Synchronous entry point — PTB manages its own event loop via run_polling()."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN not set")
 
-    redis_url = os.getenv("REDIS_URL", "").strip()
-    if not redis_url:
-        raise SystemExit("REDIS_URL not set")
-
-    try:
-        rc = redis_from_url(redis_url, decode_responses=True)
-        await rc.ping()
-    except Exception as e:
-        raise SystemExit(f"Redis error: {e}") from e
-
-    store = RedisStore(rc)
-    session = aiohttp.ClientSession()
-    feed = FeedManager()
-    await feed.start(session)
-
-    bot_core = SpreadBot(token, store, feed)
+    bot_core = SpreadBot(token)
 
     app = (
         Application.builder()
@@ -686,8 +699,8 @@ async def main() -> None:
     app.add_handler(CallbackQueryHandler(bot_core.cb_query))
 
     log.info("Bot starting…")
-    await app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True)   # synchronous — owns its own event loop
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
