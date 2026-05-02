@@ -54,43 +54,64 @@ DISPATCH_TICK_S = 1.0
 REQUIRED_CHANNEL = "@l1xosha"   # users must be subscribed to this channel
 
 
+async def _is_subscribed(bot, user_id: int) -> bool:
+    """Return True if user is a subscriber of REQUIRED_CHANNEL."""
+    from telegram.error import BadRequest as TGBadRequest, NetworkError
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+        return member.status not in ("left", "kicked", "banned")
+    except TGBadRequest:
+        # Never was a member → Telegram 400
+        return False
+    except (NetworkError, Exception):
+        return True  # fail-open for network / unknown errors
+
+
+_GATE_KB = InlineKeyboardMarkup([[
+    InlineKeyboardButton("✅ Перевірити підписку", callback_data="check_sub"),
+    InlineKeyboardButton(f"➡️ {REQUIRED_CHANNEL}", url=f"https://t.me/{REQUIRED_CHANNEL.lstrip('@')}"),
+]])
+
+
 async def _gate_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Runs before every handler (group -1). Blocks non-subscribers."""
-    from telegram.error import BadRequest as TGBadRequest, NetworkError
-
     user = update.effective_user
     if user is None:
         raise ApplicationHandlerStop
 
-    blocked = False
-    try:
-        member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user.id)
-        # "left" = was member but left; "kicked"/"banned" = removed
-        if member.status in ("left", "kicked", "banned"):
-            blocked = True
-    except ApplicationHandlerStop:
-        raise
-    except TGBadRequest:
-        # User was NEVER in the channel → Telegram returns 400 Bad Request
-        blocked = True
-    except NetworkError:
-        # Temporary network issue → fail-open (don't lock out real users)
-        blocked = False
-    except Exception:
-        # Unknown error → fail-open
-        blocked = False
+    # Let the "check_sub" callback through so we can handle it ourselves
+    cq = update.callback_query
+    if cq and cq.data == "check_sub":
+        return  # handled separately below
 
-    if blocked:
+    if not await _is_subscribed(context.bot, user.id):
         if update.message:
             await update.message.reply_text(
                 f"🔒 Бот доступний лише для підписників каналу {REQUIRED_CHANNEL}\n\n"
-                f"Підпишись → {REQUIRED_CHANNEL} і спробуй ще раз."
+                f"Підпишись на канал і натисни «✅ Перевірити підписку».",
+                reply_markup=_GATE_KB,
             )
-        elif update.callback_query:
-            await update.callback_query.answer(
-                f"🔒 Підпишись на {REQUIRED_CHANNEL}", show_alert=True
-            )
+        elif cq:
+            await cq.answer(f"🔒 Підпишись на {REQUIRED_CHANNEL}", show_alert=True)
         raise ApplicationHandlerStop
+
+
+async def _cb_check_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback: re-check subscription after user subscribes."""
+    cq = update.callback_query
+    await cq.answer()
+    user = update.effective_user
+    if user is None:
+        return
+    if await _is_subscribed(context.bot, user.id):
+        await cq.edit_message_text(
+            "✅ Підписку підтверджено! Тепер можеш користуватись ботом.\n\nНапиши /start"
+        )
+    else:
+        await cq.edit_message_text(
+            f"❌ Підписку не знайдено.\n\nПідпишись → {REQUIRED_CHANNEL} і натисни знову.",
+            reply_markup=_GATE_KB,
+        )
 
 ASK_LEG_A_EX, ASK_LEG_A_SYM, ASK_LEG_B_EX, ASK_LEG_B_SYM = range(4)
 
@@ -1001,6 +1022,8 @@ def main() -> None:
 
     # Gate: runs before every handler — blocks non-subscribers
     app.add_handler(TypeHandler(Update, _gate_check), group=-1)
+    # "Check subscription" button — runs AFTER gate (gate lets check_sub pass)
+    app.add_handler(CallbackQueryHandler(_cb_check_sub, pattern=r"^check_sub$"), group=0)
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("start",          bot_core.cmd_start))
