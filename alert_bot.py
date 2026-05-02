@@ -519,19 +519,29 @@ class SpreadBot:
     # ─── /debug — show exchange connection state
 
     async def cmd_debug(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-        cid = u.effective_chat.id
-        cfg = self._selected(cid)
-        lines = ["*Exchange connection state*\n"]
         mgr = self.feed
+        lines = ["*🔌 Exchange connections*\n"]
         for (ex_name, mt), ex in mgr._exchanges.items():
+            ws_ok = ex._ws is not None
+            tasks_ok = bool(ex._tasks)
+            # Build the WS URL that would be used
+            try:
+                ws_url = ex._ws_url()
+                ws_url_short = ws_url[len("wss://"):60] + "…"
+            except Exception:
+                ws_url_short = "?"
+            lines.append(f"*{ex_name}/{mt}*")
+            lines.append(f"  tasks={tasks_ok} ws_open={ws_ok}")
+            lines.append(f"  url: `{ws_url_short}`")
             for sym, state in ex._state.items():
                 ts = state.get("ts", 0.0)
                 age = time.monotonic() - ts if ts else None
-                stale = age is None or age > 3.0
-                status = f"⚠️ STALE ({age:.0f}s ago)" if stale and age else "⚠️ NO DATA YET" if stale else f"✅ LIVE ({age:.1f}s)"
-                lines.append(f"`{ex_name}/{mt}` `{sym}`: {status}")
-        if cfg:
-            lines.append(f"\nSelected: *{cfg.name}*")
+                if age is None or age > 3.0:
+                    status = f"⚠️ NO DATA ({age:.0f}s)" if age else "⚠️ NO DATA"
+                else:
+                    bid = state.get("bid")
+                    status = f"✅ {age:.1f}s bid={bid}"
+                lines.append(f"  sym `{sym}`: {status}")
         await u.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     # ─── threshold setters
