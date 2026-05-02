@@ -225,14 +225,17 @@ class BotState:
         self.lock = asyncio.Lock()
 
     async def get_or_create(self, store: ConfigStore, chat_id: int) -> ChatRuntime:
+        is_new = False
         async with self.lock:
             rt = self.chats.get(chat_id)
             if rt is None:
                 cfg = ChatConfig(chat_id=chat_id)
                 rt = ChatRuntime(cfg=cfg)
                 self.chats[chat_id] = rt
-                await store.upsert(cfg)
-            return rt
+                is_new = True
+        if is_new:
+            await store.upsert(rt.cfg)
+        return rt
 
     async def hydrate(self, store: ConfigStore) -> None:
         loaded = await store.load()
@@ -240,6 +243,10 @@ class BotState:
             for cid, cfg in loaded.items():
                 if cid not in self.chats:
                     self.chats[cid] = ChatRuntime(cfg=cfg)
+        if loaded:
+            log.info("hydrated %d chat(s): %s", len(loaded), list(loaded.keys()))
+        else:
+            log.info("no chats in Redis yet")
 
 
 # ----------------------------------------------------------------- formatting
@@ -650,7 +657,19 @@ async def _post_init(app: Application) -> None:
     app.bot_data["dispatcher_task"] = asyncio.create_task(
         alert_dispatcher(app, feed, state)
     )
-    log.info("bot ready; %d chats hydrated", len(state.chats))
+    log.info("bot ready; %d chat(s) loaded from Redis", len(state.chats))
+    # notify all registered chats that the bot is live again
+    if state.chats:
+        async with state.lock:
+            chat_ids = [rt.cfg.chat_id for rt in state.chats.values()]
+        for cid in chat_ids:
+            try:
+                await app.bot.send_message(
+                    chat_id=cid,
+                    text=f"✅ Bot restarted — monitoring ANTHROPIC spreads.\n{len(chat_ids)} chat(s) active.",
+                )
+            except Exception as e:
+                log.warning("restart notify failed for %s: %s", cid, e)
 
 
 async def _post_shutdown(app: Application) -> None:
