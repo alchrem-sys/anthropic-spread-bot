@@ -1,730 +1,693 @@
-"""Telegram alert bot for the ANTHROPIC IN/OUT spread.
+"""Multi-exchange spread alert bot.
 
-Reuses feeds.PriceFeed so the spread math is bit-identical to spread_monitor.py.
-Configure via .env:
-
-    TELEGRAM_BOT_TOKEN=...           # required
-    REDIS_URL=redis://...            # optional; falls back to config.json
-
-Deployable to Railway / Fly / any always-on host.
+Commands:
+  /start              -- register chat
+  /newspread          -- wizard: paste two trade URLs -> creates spread
+  /spreads            -- list spreads with inline keyboard
+  /status             -- current spread prices & spreads
+  /set_in <pct>       -- IN alert threshold for selected spread
+  /set_out <pct>      -- OUT alert threshold
+  /set_outmax <pct>   -- extreme OUT threshold
+  /set_oi <usd>       -- OI alert threshold
+  /set_out_depth <n>  -- min depth for OUT alert
+  /thresholds         -- show current settings
+  /alerts_on/off      -- toggle alerts
+  /help
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
+import aiohttp
 from dotenv import load_dotenv
-from telegram import Update
+from redis.asyncio import from_url as redis_from_url
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
+    Application, CallbackQueryHandler, CommandHandler,
+    ContextTypes, ConversationHandler, MessageHandler, filters,
 )
 
-from feeds import PriceFeed
+from exchanges import ExchangeInfo, parse_url
+from feed_manager import FeedManager, SpreadSnapshot
 
+load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
 log = logging.getLogger("alert_bot")
 
-DEFAULT_IN_THRESHOLD = 0.3
-DEFAULT_OUT_THRESHOLD = 0.3
-DEFAULT_OUT_MAX_THRESHOLD = 20.0
-DEFAULT_OI_THRESHOLD = 6_900_000.0
-DEFAULT_OUT_MIN_DEPTH = 0.5        # min coins in HL bid book within depth range
-OUT_DEPTH_RANGE_PCT = 4.5          # look this far below best HL bid
-ALERT_POLL_INTERVAL_S = 1.0
-ALERT_REFIRE_INTERVAL_S = 3.0  # spam cadence while breached
+OUT_DEPTH_RANGE_PCT = 4.5
+ALERT_INTERVAL_S = 3.0
+DISPATCH_TICK_S = 1.0
+
+ASK_URL_A, ASK_URL_B = range(2)
 
 
-# ----------------------------------------------------------------- config store
-
+# ─────────────────────────────────────────── data models
 
 @dataclass
-class ChatConfig:
-    chat_id: int
-    in_threshold: float = DEFAULT_IN_THRESHOLD
-    out_threshold: float = DEFAULT_OUT_THRESHOLD
-    out_max_threshold: float = DEFAULT_OUT_MAX_THRESHOLD
-    oi_threshold: float = DEFAULT_OI_THRESHOLD
-    out_min_depth: float = DEFAULT_OUT_MIN_DEPTH
+class SpreadConfig:
+    spread_id: str
+    leg_a: ExchangeInfo
+    leg_b: ExchangeInfo
+    in_threshold: float = 0.3
+    out_threshold: float = 0.3
+    out_max_threshold: float = 20.0
+    oi_threshold: float = 6_900_000.0
+    out_min_depth: float = 0.5
     alerts_on: bool = True
 
+    @property
+    def name(self) -> str:
+        return f"{self.leg_a.display} / {self.leg_b.display}"
 
-class ConfigStore:
-    async def load(self) -> dict[int, ChatConfig]:
-        raise NotImplementedError
-
-    async def upsert(self, cfg: ChatConfig) -> None:
-        raise NotImplementedError
-
-    async def close(self) -> None:
-        pass
-
-
-class JsonConfigStore(ConfigStore):
-    def __init__(self, path: str = "config.json") -> None:
-        self.path = path
-        self._lock = asyncio.Lock()
-
-    async def load(self) -> dict[int, ChatConfig]:
-        async with self._lock:
-            return await asyncio.get_running_loop().run_in_executor(None, self._load_sync)
-
-    def _load_sync(self) -> dict[int, ChatConfig]:
-        if not os.path.exists(self.path):
-            return {}
-        try:
-            with open(self.path) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return {}
-        out: dict[int, ChatConfig] = {}
-        for k, v in (data.get("chats") or {}).items():
-            try:
-                cid = int(k)
-                out[cid] = ChatConfig(
-                    chat_id=cid,
-                    in_threshold=float(v.get("in_threshold", DEFAULT_IN_THRESHOLD)),
-                    out_threshold=float(v.get("out_threshold", DEFAULT_OUT_THRESHOLD)),
-                    out_max_threshold=float(v.get("out_max_threshold", DEFAULT_OUT_MAX_THRESHOLD)),
-                    oi_threshold=float(v.get("oi_threshold", DEFAULT_OI_THRESHOLD)),
-                    out_min_depth=float(v.get("out_min_depth", DEFAULT_OUT_MIN_DEPTH)),
-                    alerts_on=bool(v.get("alerts_on", True)),
-                )
-            except (TypeError, ValueError):
-                continue
-        return out
-
-    async def upsert(self, cfg: ChatConfig) -> None:
-        async with self._lock:
-            await asyncio.get_running_loop().run_in_executor(None, self._upsert_sync, cfg)
-
-    def _upsert_sync(self, cfg: ChatConfig) -> None:
-        data: dict[str, Any] = {"chats": {}}
-        if os.path.exists(self.path):
-            try:
-                with open(self.path) as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                data = {"chats": {}}
-        data.setdefault("chats", {})[str(cfg.chat_id)] = {
-            "in_threshold": cfg.in_threshold,
-            "out_threshold": cfg.out_threshold,
-            "out_max_threshold": cfg.out_max_threshold,
-            "oi_threshold": cfg.oi_threshold,
-            "out_min_depth": cfg.out_min_depth,
-            "alerts_on": cfg.alerts_on,
+    def to_redis_hash(self) -> dict:
+        return {
+            "leg_a_ex":   self.leg_a.exchange,
+            "leg_a_sym":  self.leg_a.symbol,
+            "leg_a_mt":   self.leg_a.market_type,
+            "leg_a_disp": self.leg_a.display,
+            "leg_b_ex":   self.leg_b.exchange,
+            "leg_b_sym":  self.leg_b.symbol,
+            "leg_b_mt":   self.leg_b.market_type,
+            "leg_b_disp": self.leg_b.display,
+            "in_threshold":     str(self.in_threshold),
+            "out_threshold":    str(self.out_threshold),
+            "out_max_threshold":str(self.out_max_threshold),
+            "oi_threshold":     str(self.oi_threshold),
+            "out_min_depth":    str(self.out_min_depth),
+            "alerts_on":        "1" if self.alerts_on else "0",
         }
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, self.path)
-
-
-class RedisConfigStore(ConfigStore):
-    def __init__(self, redis_client) -> None:
-        self.r = redis_client
 
     @classmethod
-    async def try_create(cls, url: str) -> Optional["RedisConfigStore"]:
-        try:
-            from redis.asyncio import from_url
-
-            client = from_url(url, decode_responses=True)
-            await client.ping()
-            return cls(client)
-        except Exception as e:
-            log.warning("redis unavailable (%s); falling back to JSON", e)
-            return None
-
-    async def load(self) -> dict[int, ChatConfig]:
-        ids = await self.r.smembers("chats")
-        out: dict[int, ChatConfig] = {}
-        for sid in ids:
-            try:
-                cid = int(sid)
-            except ValueError:
-                continue
-            data = await self.r.hgetall(f"chat:{cid}")
-            out[cid] = ChatConfig(
-                chat_id=cid,
-                in_threshold=float(data.get("in_threshold", DEFAULT_IN_THRESHOLD)),
-                out_threshold=float(data.get("out_threshold", DEFAULT_OUT_THRESHOLD)),
-                out_max_threshold=float(data.get("out_max_threshold", DEFAULT_OUT_MAX_THRESHOLD)),
-                oi_threshold=float(data.get("oi_threshold", DEFAULT_OI_THRESHOLD)),
-                out_min_depth=float(data.get("out_min_depth", DEFAULT_OUT_MIN_DEPTH)),
-                alerts_on=data.get("alerts_on", "1") not in ("0", "false", "False"),
-            )
-        return out
-
-    async def upsert(self, cfg: ChatConfig) -> None:
-        await self.r.sadd("chats", cfg.chat_id)
-        await self.r.hset(
-            f"chat:{cfg.chat_id}",
-            mapping={
-                "in_threshold": str(cfg.in_threshold),
-                "out_threshold": str(cfg.out_threshold),
-                "out_max_threshold": str(cfg.out_max_threshold),
-                "oi_threshold": str(cfg.oi_threshold),
-                "out_min_depth": str(cfg.out_min_depth),
-                "alerts_on": "1" if cfg.alerts_on else "0",
-            },
+    def from_redis_hash(cls, spread_id: str, h: dict) -> "SpreadConfig":
+        leg_a = ExchangeInfo(
+            exchange=h["leg_a_ex"], symbol=h["leg_a_sym"],
+            market_type=h["leg_a_mt"], display=h["leg_a_disp"],
         )
-
-    async def close(self) -> None:
-        try:
-            await self.r.aclose()
-        except Exception:
-            pass
-
-
-async def build_config_store() -> ConfigStore:
-    url = os.getenv("REDIS_URL", "").strip()
-    if not url:
-        raise SystemExit("REDIS_URL is not set. Add it to Railway env vars (Upstash free tier works).")
-    try:
-        from redis.asyncio import from_url
-        client = from_url(url, decode_responses=True)
-        await client.ping()
-    except Exception as e:
-        raise SystemExit(f"Cannot connect to Redis ({url.split('@')[-1]}): {e}") from e
-    log.info("config store: Redis at %s", url.split("@")[-1])
-    return RedisConfigStore(client)
-
-
-# ----------------------------------------------------------------- shared state
+        leg_b = ExchangeInfo(
+            exchange=h["leg_b_ex"], symbol=h["leg_b_sym"],
+            market_type=h["leg_b_mt"], display=h["leg_b_disp"],
+        )
+        return cls(
+            spread_id=spread_id, leg_a=leg_a, leg_b=leg_b,
+            in_threshold=float(h.get("in_threshold", 0.3)),
+            out_threshold=float(h.get("out_threshold", 0.3)),
+            out_max_threshold=float(h.get("out_max_threshold", 20.0)),
+            oi_threshold=float(h.get("oi_threshold", 6_900_000.0)),
+            out_min_depth=float(h.get("out_min_depth", 0.5)),
+            alerts_on=h.get("alerts_on", "1") == "1",
+        )
 
 
 @dataclass
 class AlertChannelState:
+    active: bool = False
     last_fired: float = 0.0
-    breached: bool = False
 
 
 @dataclass
 class ChatRuntime:
-    cfg: ChatConfig
-    in_state: AlertChannelState = field(default_factory=AlertChannelState)
-    out_state: AlertChannelState = field(default_factory=AlertChannelState)
-    out_max_state: AlertChannelState = field(default_factory=AlertChannelState)
-    oi_state: AlertChannelState = field(default_factory=AlertChannelState)
+    chat_id: int
+    selected_spread_id: Optional[str] = None
+    alert_states: dict = field(default_factory=dict)   # sid -> {ch: AlertChannelState}
+
+    def channel(self, sid: str, name: str) -> AlertChannelState:
+        self.alert_states.setdefault(sid, {})
+        self.alert_states[sid].setdefault(name, AlertChannelState())
+        return self.alert_states[sid][name]
 
 
-class BotState:
-    def __init__(self) -> None:
-        self.chats: dict[int, ChatRuntime] = {}
-        self.lock = asyncio.Lock()
+# ─────────────────────────────────────────── Redis store
 
-    async def get_or_create(self, store: ConfigStore, chat_id: int) -> ChatRuntime:
-        is_new = False
-        async with self.lock:
-            rt = self.chats.get(chat_id)
-            if rt is None:
-                cfg = ChatConfig(chat_id=chat_id)
-                rt = ChatRuntime(cfg=cfg)
-                self.chats[chat_id] = rt
-                is_new = True
-        if is_new:
-            await store.upsert(rt.cfg)
-        return rt
+class RedisStore:
+    def __init__(self, client) -> None:
+        self._r = client
 
-    async def hydrate(self, store: ConfigStore) -> None:
-        loaded = await store.load()
-        async with self.lock:
-            for cid, cfg in loaded.items():
-                if cid not in self.chats:
-                    self.chats[cid] = ChatRuntime(cfg=cfg)
-        if loaded:
-            log.info("hydrated %d chat(s): %s", len(loaded), list(loaded.keys()))
-        else:
-            log.info("no chats in Redis yet")
+    async def register_chat(self, chat_id: int) -> None:
+        await self._r.sadd("chats", str(chat_id))
 
+    async def all_chat_ids(self) -> list[int]:
+        ids = await self._r.smembers("chats")
+        return [int(i) for i in ids]
 
-# ----------------------------------------------------------------- formatting
+    async def get_selected_spread(self, chat_id: int) -> Optional[str]:
+        return await self._r.get(f"chat:{chat_id}:selected")
 
+    async def set_selected_spread(self, chat_id: int, sid: str) -> None:
+        await self._r.set(f"chat:{chat_id}:selected", sid)
 
-def _fmt_pct(v: Optional[float]) -> str:
-    if v is None:
-        return "--"
-    sign = "+" if v >= 0 else ""
-    return f"{sign}{v:.3f}%"
+    async def save_spread(self, chat_id: int, cfg: SpreadConfig) -> None:
+        await self._r.hset(f"spread:{cfg.spread_id}", mapping=cfg.to_redis_hash())
+        await self._r.sadd(f"spreads:{chat_id}", cfg.spread_id)
 
+    async def delete_spread(self, chat_id: int, sid: str) -> None:
+        await self._r.delete(f"spread:{sid}")
+        await self._r.srem(f"spreads:{chat_id}", sid)
 
-def _fmt_usd(v: Optional[float], decimals: int = 4) -> str:
-    if v is None:
-        return "--"
-    if v >= 0:
-        return f"+${v:.{decimals}f}"
-    return f"-${abs(v):.{decimals}f}"
+    async def load_spreads(self, chat_id: int) -> list[SpreadConfig]:
+        ids = await self._r.smembers(f"spreads:{chat_id}")
+        out = []
+        for sid in ids:
+            h = await self._r.hgetall(f"spread:{sid}")
+            if h:
+                try:
+                    out.append(SpreadConfig.from_redis_hash(sid, h))
+                except Exception as e:
+                    log.warning("skip bad spread %s: %s", sid, e)
+        return out
+
+    async def update_field(self, sid: str, key: str, value: str) -> None:
+        await self._r.hset(f"spread:{sid}", key, value)
+
+    async def set_monitor_spread(self, sid: str) -> None:
+        await self._r.set("monitor:active_spread", sid)
 
 
-def _fmt_price(v: Optional[float]) -> str:
-    if v is None:
-        return "--"
-    return f"${v:.4f}"
+# ─────────────────────────────────────────── bot
+
+class SpreadBot:
+    def __init__(self, token: str, store: RedisStore, feed: FeedManager) -> None:
+        self._token = token
+        self._store = store
+        self._feed = feed
+        self._app: Optional[Application] = None
+        self._runtimes:    dict[int, ChatRuntime]   = {}
+        self._spreads:     dict[str, SpreadConfig]  = {}   # sid -> cfg (global)
+        self._chat_spreads:dict[int, list[str]]     = {}   # cid -> [sid]
+        self._conv_a:      dict[int, ExchangeInfo]  = {}   # temp conv state
+
+    async def _post_init(self, app: Application) -> None:
+        self._app = app
+        await self._hydrate()
+        asyncio.create_task(self._dispatch_loop())
+
+    async def _hydrate(self) -> None:
+        chat_ids = await self._store.all_chat_ids()
+        for cid in chat_ids:
+            rt = ChatRuntime(chat_id=cid)
+            rt.selected_spread_id = await self._store.get_selected_spread(cid)
+            self._runtimes[cid] = rt
+            spreads = await self._store.load_spreads(cid)
+            self._chat_spreads[cid] = [s.spread_id for s in spreads]
+            for cfg in spreads:
+                self._spreads[cfg.spread_id] = cfg
+                await self._feed.subscribe(cfg.leg_a)
+                await self._feed.subscribe(cfg.leg_b)
+        log.info("hydrated %d chats, %d spreads", len(chat_ids), len(self._spreads))
+        # restart notification
+        if self._app:
+            for cid in chat_ids:
+                try:
+                    await self._app.bot.send_message(cid, "🔄 Bot restarted — monitoring resumed.")
+                except Exception:
+                    pass
+
+    def _rt(self, cid: int) -> ChatRuntime:
+        if cid not in self._runtimes:
+            self._runtimes[cid] = ChatRuntime(chat_id=cid)
+        return self._runtimes[cid]
+
+    def _selected(self, cid: int) -> Optional[SpreadConfig]:
+        rt = self._rt(cid)
+        sid = rt.selected_spread_id
+        if sid and sid in self._spreads:
+            return self._spreads[sid]
+        ids = self._chat_spreads.get(cid, [])
+        if ids:
+            rt.selected_spread_id = ids[0]
+            return self._spreads.get(ids[0])
+        return None
+
+    # ─── commands
+
+    async def cmd_start(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        cid = u.effective_chat.id
+        await self._store.register_chat(cid)
+        self._runtimes.setdefault(cid, ChatRuntime(chat_id=cid))
+        self._chat_spreads.setdefault(cid, [])
+        await u.message.reply_text(
+            "👋 Spread monitor bot.\n\n"
+            "Use /newspread to add a spread.\n"
+            "/help for all commands."
+        )
+
+    async def cmd_help(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        await u.message.reply_text(
+            "/newspread — add spread (2 trade URLs)\n"
+            "/spreads — list & select spreads\n"
+            "/status — live prices\n"
+            "/set_in /set_out /set_outmax /set_oi /set_out_depth — thresholds\n"
+            "/thresholds — show settings\n"
+            "/alerts_on | /alerts_off — toggle\n"
+            "/cancel — cancel current action"
+        )
+
+    # ─── /newspread conversation
+
+    async def cmd_newspread(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        await u.message.reply_text(
+            "📎 Send the trade URL for *Leg A* (the venue you'll SHORT to enter).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_URL_A
+
+    async def conv_url_a(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        cid = u.effective_chat.id
+        info = parse_url(u.message.text.strip())
+        if info is None:
+            await u.message.reply_text(
+                "❌ Unrecognised URL. Paste a direct trade page, e.g.:\n"
+                "`https://www.gate.io/futures/USDT/ANTHROPIC_USDT`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ASK_URL_A
+        self._conv_a[cid] = info
+        await u.message.reply_text(
+            f"✅ Leg A: *{info.display}*\n\n"
+            "📎 Now send the URL for *Leg B* (the venue you'll LONG to enter).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_URL_B
+
+    async def conv_url_b(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        cid = u.effective_chat.id
+        info_b = parse_url(u.message.text.strip())
+        if info_b is None:
+            await u.message.reply_text("❌ Unrecognised URL. Try again.")
+            return ASK_URL_B
+        info_a = self._conv_a.pop(cid, None)
+        if info_a is None:
+            await u.message.reply_text("Session expired. Please /newspread again.")
+            return ConversationHandler.END
+
+        sid = str(uuid.uuid4())[:8]
+        cfg = SpreadConfig(spread_id=sid, leg_a=info_a, leg_b=info_b)
+        await self._store.register_chat(cid)
+        await self._store.save_spread(cid, cfg)
+        self._spreads[sid] = cfg
+        self._chat_spreads.setdefault(cid, []).append(sid)
+        await self._feed.subscribe(info_a)
+        await self._feed.subscribe(info_b)
+        rt = self._rt(cid)
+        rt.selected_spread_id = sid
+        await self._store.set_selected_spread(cid, sid)
+        await u.message.reply_text(
+            f"✅ Spread added!\n*{cfg.name}*\n\n"
+            f"Thresholds: IN {cfg.in_threshold}% | OUT {cfg.out_threshold}%\n"
+            "Use /status for live prices.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
+    async def conv_cancel(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        self._conv_a.pop(u.effective_chat.id, None)
+        await u.message.reply_text("Cancelled.")
+        return ConversationHandler.END
+
+    # ─── /spreads
+
+    async def cmd_spreads(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        cid = u.effective_chat.id
+        ids = self._chat_spreads.get(cid, [])
+        if not ids:
+            await u.message.reply_text("No spreads yet. Use /newspread.")
+            return
+        rt = self._rt(cid)
+        kb = []
+        for sid in ids:
+            cfg = self._spreads.get(sid)
+            if not cfg:
+                continue
+            tick = "✅ " if sid == rt.selected_spread_id else ""
+            kb.append([InlineKeyboardButton(f"{tick}{cfg.name}", callback_data=f"sel:{sid}")])
+        kb.append([InlineKeyboardButton("➕ New spread", callback_data="newspread")])
+        await u.message.reply_text("Your spreads:", reply_markup=InlineKeyboardMarkup(kb))
+
+    async def cb_query(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        q = u.callback_query
+        await q.answer()
+        cid = u.effective_chat.id
+        data: str = q.data
+
+        if data == "newspread":
+            await q.message.reply_text(
+                "📎 Send the trade URL for *Leg A*.", parse_mode=ParseMode.MARKDOWN
+            )
+        elif data.startswith("sel:"):
+            sid = data[4:]
+            cfg = self._spreads.get(sid)
+            if not cfg:
+                await q.edit_message_text("Spread not found.")
+                return
+            rt = self._rt(cid)
+            rt.selected_spread_id = sid
+            await self._store.set_selected_spread(cid, sid)
+            await self._show_detail(q, cid, cfg)
+        elif data.startswith("del:"):
+            sid = data[4:]
+            await self._store.delete_spread(cid, sid)
+            self._spreads.pop(sid, None)
+            ids = self._chat_spreads.get(cid, [])
+            if sid in ids:
+                ids.remove(sid)
+            rt = self._rt(cid)
+            if rt.selected_spread_id == sid:
+                rt.selected_spread_id = ids[0] if ids else None
+            await q.edit_message_text("🗑 Spread deleted.")
+        elif data.startswith("toggle:"):
+            sid = data[7:]
+            cfg = self._spreads.get(sid)
+            if cfg:
+                cfg.alerts_on = not cfg.alerts_on
+                await self._store.update_field(sid, "alerts_on", "1" if cfg.alerts_on else "0")
+                await self._show_detail(q, cid, cfg)
+        elif data.startswith("terminal:"):
+            sid = data[9:]
+            await self._store.set_monitor_spread(sid)
+            await q.answer("📺 Terminal synced!", show_alert=False)
+
+    async def _show_detail(self, q, cid: int, cfg: SpreadConfig) -> None:
+        ss = self._feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
+        in_s  = f"{ss.in_spread_pct:+.3f}%"  if ss.in_spread_pct  is not None else "N/A"
+        out_s = f"{ss.out_spread_pct:+.3f}%" if ss.out_spread_pct is not None else "N/A"
+        alerts = "ON ✅" if cfg.alerts_on else "OFF 🔇"
+        text = (
+            f"*{cfg.name}*\n\n"
+            f"IN: `{in_s}` | OUT: `{out_s}`\n"
+            f"Thresholds: IN {cfg.in_threshold}% | OUT {cfg.out_threshold}%\n"
+            f"Alerts: {alerts}"
+        )
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔔 Toggle alerts", callback_data=f"toggle:{cfg.spread_id}"),
+                InlineKeyboardButton("📺 Terminal", callback_data=f"terminal:{cfg.spread_id}"),
+            ],
+            [InlineKeyboardButton("🗑 Delete spread", callback_data=f"del:{cfg.spread_id}")],
+        ])
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        except Exception:
+            pass
+
+    # ─── /status
+
+    async def cmd_status(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        cid = u.effective_chat.id
+        cfg = self._selected(cid)
+        if cfg is None:
+            await u.message.reply_text("No spread selected. Use /newspread first.")
+            return
+        ss = self._feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
+        await u.message.reply_text(_fmt_status(cfg, ss), parse_mode=ParseMode.MARKDOWN)
+
+    # ─── threshold setters
+
+    async def _set_field(self, u: Update, c: ContextTypes.DEFAULT_TYPE,
+                          attr: str, label: str) -> None:
+        cid = u.effective_chat.id
+        cfg = self._selected(cid)
+        if cfg is None:
+            await u.message.reply_text("No spread selected.")
+            return
+        if not c.args:
+            await u.message.reply_text(f"Current {label}: {getattr(cfg, attr)}\nUsage: /{label} <value>")
+            return
+        try:
+            val = float(c.args[0])
+        except ValueError:
+            await u.message.reply_text(f"Invalid: {c.args[0]}")
+            return
+        setattr(cfg, attr, val)
+        await self._store.update_field(cfg.spread_id, attr, str(val))
+        await u.message.reply_text(f"✅ {label} = {val}")
+
+    async def cmd_set_in(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._set_field(u, c, "in_threshold", "set_in")
+
+    async def cmd_set_out(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._set_field(u, c, "out_threshold", "set_out")
+
+    async def cmd_set_outmax(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._set_field(u, c, "out_max_threshold", "set_outmax")
+
+    async def cmd_set_oi(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._set_field(u, c, "oi_threshold", "set_oi")
+
+    async def cmd_set_out_depth(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._set_field(u, c, "out_min_depth", "set_out_depth")
+
+    async def cmd_thresholds(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        cid = u.effective_chat.id
+        cfg = self._selected(cid)
+        if cfg is None:
+            await u.message.reply_text("No spread selected.")
+            return
+        await u.message.reply_text(
+            f"*{cfg.name}*\n\n"
+            f"IN: {cfg.in_threshold}%  OUT: {cfg.out_threshold}%\n"
+            f"OUT-max: {cfg.out_max_threshold}%\n"
+            f"OI: ${cfg.oi_threshold:,.0f}\n"
+            f"Min depth: {cfg.out_min_depth} coins\n"
+            f"Alerts: {'ON' if cfg.alerts_on else 'OFF'}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    async def cmd_alerts_on(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        cid = u.effective_chat.id
+        cfg = self._selected(cid)
+        if not cfg:
+            await u.message.reply_text("No spread selected.")
+            return
+        cfg.alerts_on = True
+        await self._store.update_field(cfg.spread_id, "alerts_on", "1")
+        await u.message.reply_text("✅ Alerts ON")
+
+    async def cmd_alerts_off(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        cid = u.effective_chat.id
+        cfg = self._selected(cid)
+        if not cfg:
+            await u.message.reply_text("No spread selected.")
+            return
+        cfg.alerts_on = False
+        await self._store.update_field(cfg.spread_id, "alerts_on", "0")
+        await u.message.reply_text("🔇 Alerts OFF")
+
+    # ─── dispatcher
+
+    async def _dispatch_loop(self) -> None:
+        bot: Bot = self._app.bot
+        while True:
+            await asyncio.sleep(DISPATCH_TICK_S)
+            now = time.monotonic()
+            for cid, rt in list(self._runtimes.items()):
+                for sid in list(self._chat_spreads.get(cid, [])):
+                    cfg = self._spreads.get(sid)
+                    if not cfg or not cfg.alerts_on:
+                        continue
+                    try:
+                        ss = self._feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
+                        await self._check(bot, cid, cfg, ss, rt, now)
+                    except Exception as e:
+                        log.debug("dispatch err cid=%s sid=%s: %s", cid, sid, e)
+
+    async def _check(self, bot, cid, cfg, ss: SpreadSnapshot, rt, now) -> None:
+        sid = cfg.spread_id
+
+        # IN
+        if ss.in_spread_pct is not None:
+            ch = rt.channel(sid, "in")
+            if ss.in_spread_pct >= cfg.in_threshold:
+                if now - ch.last_fired >= ALERT_INTERVAL_S:
+                    await _send_alert(bot, cid, cfg, ss, "IN")
+                    ch.last_fired = now
+            else:
+                ch.active = False
+
+        # OUT
+        if ss.out_spread_pct is not None:
+            ch = rt.channel(sid, "out")
+            depth_ok = True
+            if cfg.out_min_depth > 0:
+                da = ss.out_depth_a(OUT_DEPTH_RANGE_PCT)
+                db = ss.out_depth_b(OUT_DEPTH_RANGE_PCT)
+                depth_ok = da >= cfg.out_min_depth and db >= cfg.out_min_depth
+            if ss.out_spread_pct >= cfg.out_threshold and depth_ok:
+                if now - ch.last_fired >= ALERT_INTERVAL_S:
+                    await _send_alert(bot, cid, cfg, ss, "OUT")
+                    ch.last_fired = now
+            else:
+                ch.active = False
+
+        # OUT-MAX
+        if ss.out_spread_pct is not None:
+            ch = rt.channel(sid, "out_max")
+            if ss.out_spread_pct >= cfg.out_max_threshold:
+                if now - ch.last_fired >= ALERT_INTERVAL_S:
+                    await _send_alert(bot, cid, cfg, ss, "OUT_MAX")
+                    ch.last_fired = now
+            else:
+                ch.active = False
+
+        # OI
+        oi_vals = [v for v in (ss.leg_a.oi_usd, ss.leg_b.oi_usd) if v is not None]
+        if oi_vals:
+            ch = rt.channel(sid, "oi")
+            max_oi = max(oi_vals)
+            if max_oi >= cfg.oi_threshold:
+                if now - ch.last_fired >= ALERT_INTERVAL_S:
+                    await _send_oi_alert(bot, cid, cfg, max_oi)
+                    ch.last_fired = now
+            else:
+                ch.active = False
 
 
-def _fmt_funding(v: Optional[float]) -> str:
-    if v is None:
-        return "--"
-    return f"{v * 100:+.4f}%"
+# ─────────────────────────────────────────── formatters
 
-
-def _now_utc_str() -> str:
+def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def fmt_in_alert(snap: dict) -> str:
-    g = snap["gate"]
-    h = snap["hl"]
+def _fmt_status(cfg: SpreadConfig, ss: SpreadSnapshot) -> str:
+    a, b = ss.leg_a, ss.leg_b
+    in_p  = f"{ss.in_spread_pct:+.3f}%"  if ss.in_spread_pct  is not None else "N/A"
+    out_p = f"{ss.out_spread_pct:+.3f}%" if ss.out_spread_pct is not None else "N/A"
+    in_u  = f"${ss.in_spread_usd:+.4f}"  if ss.in_spread_usd  is not None else ""
+    out_u = f"${ss.out_spread_usd:+.4f}" if ss.out_spread_usd is not None else ""
+    af = f"{a.funding*100:.4f}%" if a.funding is not None else "N/A"
+    bf = f"{b.funding*100:.4f}%" if b.funding is not None else "N/A"
+    sa = " ⚠️STALE" if a.stale else ""
+    sb = " ⚠️STALE" if b.stale else ""
     return (
-        "🟢 ARB ENTRY SIGNAL — ANTHROPIC\n"
-        f"📈 IN Spread: {_fmt_pct(snap['in_spread_pct'])} ({_fmt_usd(snap['in_spread_usd'])})\n"
-        f"Gate bid: {_fmt_price(g['bid'])} | HL ask: {_fmt_price(h['ask'])}\n"
-        f"Fund diff: Gate {_fmt_funding(g['funding'])} / HL {_fmt_funding(h['funding'])}\n"
-        f"⏰ {_now_utc_str()}"
+        f"*{cfg.name}*\n\n"
+        f"*A* {cfg.leg_a.display}{sa}\n"
+        f"  bid `{a.bid}` ask `{a.ask}` fund {af}\n\n"
+        f"*B* {cfg.leg_b.display}{sb}\n"
+        f"  bid `{b.bid}` ask `{b.ask}` fund {bf}\n\n"
+        f"IN  `{in_p}` {in_u}\n"
+        f"OUT `{out_p}` {out_u}\n\n"
+        f"⏰ {_ts()}"
     )
 
 
-def fmt_out_alert(snap: dict, hl_depth: float, gate_depth: float) -> str:
-    g = snap["gate"]
-    h = snap["hl"]
-    return (
-        "🔴 ARB EXIT SIGNAL — ANTHROPIC\n"
-        f"📉 OUT Spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})\n"
-        f"HL bid: {_fmt_price(h['bid'])} | Gate ask: {_fmt_price(g['ask'])}\n"
-        f"Depth (-{OUT_DEPTH_RANGE_PCT}%): HL bids {hl_depth:.3f} | Gate asks {gate_depth:.3f} coins\n"
-        f"Fund diff: Gate {_fmt_funding(g['funding'])} / HL {_fmt_funding(h['funding'])}\n"
-        f"⏰ {_now_utc_str()}"
-    )
-
-
-def _fmt_oi(v: Optional[float]) -> str:
-    if v is None:
-        return "--"
-    return f"${v / 1_000_000:.3f}M"
-
-
-def fmt_out_max_alert(snap: dict, hl_depth: float, gate_depth: float) -> str:
-    g = snap["gate"]
-    h = snap["hl"]
-    return (
-        "🔴🔴 OUT SPREAD EXTREME — ANTHROPIC\n"
-        f"📉 OUT Spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})\n"
-        f"HL bid: {_fmt_price(h['bid'])} | Gate ask: {_fmt_price(g['ask'])}\n"
-        f"Depth (-{OUT_DEPTH_RANGE_PCT}%): HL bids {hl_depth:.3f} | Gate asks {gate_depth:.3f} coins\n"
-        f"Fund diff: Gate {_fmt_funding(g['funding'])} / HL {_fmt_funding(h['funding'])}\n"
-        f"⏰ {_now_utc_str()}"
-    )
-
-
-def fmt_oi_alert(snap: dict, threshold: float) -> str:
-    h = snap["hl"]
-    oi_usd = snap["hl_oi_usd"]
-    return (
-        "📊 OI LIMIT ALERT — ANTHROPIC\n"
-        f"HL OI: {_fmt_oi(oi_usd)} ≥ threshold {_fmt_oi(threshold)}\n"
-        f"HL mark: {_fmt_price(h.get('mark_px'))} | OI coins: {h.get('oi', '--')}\n"
-        f"⏰ {_now_utc_str()}"
-    )
-
-
-def fmt_status(snap: dict, cfg: ChatConfig) -> str:
-    g = snap["gate"]
-    h = snap["hl"]
-    return (
-        "📊 ANTHROPIC status\n"
-        f"Gate.io  bid={_fmt_price(g['bid'])} ask={_fmt_price(g['ask'])} "
-        f"fund={_fmt_funding(g['funding'])} {'STALE' if snap['gate_stale'] else 'LIVE'}\n"
-        f"HyperLiq bid={_fmt_price(h['bid'])} ask={_fmt_price(h['ask'])} "
-        f"fund={_fmt_funding(h['funding'])} OI={_fmt_oi(snap.get('hl_oi_usd'))} "
-        f"{'STALE' if snap['hl_stale'] else 'LIVE'}\n"
-        f"Out zone depth (-{OUT_DEPTH_RANGE_PCT}%): "
-        f"HL {PriceFeed.hl_out_depth(snap.get('hl_bids',[]), snap['gate']['ask'] or 0, OUT_DEPTH_RANGE_PCT):.3f} | "
-        f"Gate {PriceFeed.gate_out_depth(snap.get('gate_asks',[]), snap['hl']['bid'] or 0, OUT_DEPTH_RANGE_PCT):.3f} "
-        f"coins (min {cfg.out_min_depth})\n"
-        f"\nIN  spread: {_fmt_pct(snap['in_spread_pct'])} ({_fmt_usd(snap['in_spread_usd'])})  "
-        f"thr={cfg.in_threshold:.3f}%\n"
-        f"OUT spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})  "
-        f"thr={cfg.out_threshold:.3f}% / max={cfg.out_max_threshold:.3f}%\n"
-        f"OI threshold: {_fmt_oi(cfg.oi_threshold)}\n"
-        f"alerts: {'ON' if cfg.alerts_on else 'OFF'}"
-    )
-
-
-# ----------------------------------------------------------------- handlers
-
-
-def _bot_data(ctx: ContextTypes.DEFAULT_TYPE) -> dict:
-    return ctx.application.bot_data
-
-
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None:
-        return
-    bd = _bot_data(ctx)
-    state: BotState = bd["state"]
-    store: ConfigStore = bd["store"]
-    rt = await state.get_or_create(store, update.effective_chat.id)
-    await update.effective_chat.send_message(
-        "👋 ANTHROPIC spread alert bot connected.\n\n"
-        f"IN  threshold: {rt.cfg.in_threshold:.3f}%\n"
-        f"OUT threshold: {rt.cfg.out_threshold:.3f}%\n"
-        f"OUT max threshold: {rt.cfg.out_max_threshold:.3f}%\n"
-        f"OI threshold: {_fmt_oi(rt.cfg.oi_threshold)}\n"
-        f"OUT min depth: {rt.cfg.out_min_depth} coins (range -{OUT_DEPTH_RANGE_PCT}%)\n"
-        f"Alerts: {'ON' if rt.cfg.alerts_on else 'OFF'}\n\n"
-        "Commands: /status /set_in /set_out /set_outmax /set_oi /set_out_depth /thresholds /alerts_on /alerts_off /help"
-    )
-
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None:
-        return
-    await update.effective_chat.send_message(
-        "Commands:\n"
-        "/start — register and show thresholds\n"
-        "/status — live spread + OI snapshot\n"
-        "/set_in <pct> — set IN spread alert threshold (e.g. /set_in 0.5)\n"
-        "/set_out <pct> — set OUT spread lower threshold\n"
-        "/set_outmax <pct> — set OUT spread upper threshold (e.g. /set_outmax 20)\n"
-        "/set_oi <millions> — set OI alert threshold in $M (e.g. /set_oi 6.9)\n"
-        f"/set_out_depth <coins> — min HL bid depth within -{OUT_DEPTH_RANGE_PCT}% for OUT alert (e.g. /set_out_depth 0.5)\n"
-        "/thresholds — show all thresholds\n"
-        "/alerts_on — enable alerts in this chat\n"
-        "/alerts_off — disable alerts in this chat\n"
-        "/help — this message"
-    )
-
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None:
-        return
-    bd = _bot_data(ctx)
-    state: BotState = bd["state"]
-    store: ConfigStore = bd["store"]
-    feed: PriceFeed = bd["feed"]
-    rt = await state.get_or_create(store, update.effective_chat.id)
-    snap = await feed.snapshot()
-    await update.effective_chat.send_message(fmt_status(snap, rt.cfg))
-
-
-async def _set_pct_threshold(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, kind: str
-) -> None:
-    if update.effective_chat is None:
-        return
-    bd = _bot_data(ctx)
-    state: BotState = bd["state"]
-    store: ConfigStore = bd["store"]
-    cmd = {"IN": "set_in", "OUT": "set_out", "OUT_MAX": "set_outmax"}[kind]
-    if not ctx.args:
-        await update.effective_chat.send_message(f"Usage: /{cmd} <pct>")
-        return
-    try:
-        val = float(ctx.args[0])
-    except ValueError:
-        await update.effective_chat.send_message("Could not parse number.")
-        return
-    rt = await state.get_or_create(store, update.effective_chat.id)
-    if kind == "IN":
-        rt.cfg.in_threshold = val
-    elif kind == "OUT":
-        rt.cfg.out_threshold = val
-    else:
-        rt.cfg.out_max_threshold = val
-    await store.upsert(rt.cfg)
-    label = {"IN": "IN", "OUT": "OUT", "OUT_MAX": "OUT max"}[kind]
-    await update.effective_chat.send_message(f"{label} threshold set to {val:.3f}%")
-
-
-async def cmd_set_in(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_pct_threshold(update, ctx, "IN")
-
-
-async def cmd_set_out(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_pct_threshold(update, ctx, "OUT")
-
-
-async def cmd_set_outmax(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_pct_threshold(update, ctx, "OUT_MAX")
-
-
-async def cmd_set_out_depth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None:
-        return
-    bd = _bot_data(ctx)
-    state: BotState = bd["state"]
-    store: ConfigStore = bd["store"]
-    if not ctx.args:
-        await update.effective_chat.send_message(
-            f"Usage: /set_out_depth <coins>  (e.g. /set_out_depth 0.5)\n"
-            f"OUT alerts only fire when HL bid depth within -{OUT_DEPTH_RANGE_PCT}% ≥ this value."
+async def _send_alert(bot, cid, cfg: SpreadConfig, ss: SpreadSnapshot, ch: str) -> None:
+    a, b = ss.leg_a, ss.leg_b
+    af = f"{a.funding*100:.4f}%" if a.funding is not None else "N/A"
+    bf = f"{b.funding*100:.4f}%" if b.funding is not None else "N/A"
+    if ch == "IN":
+        p = f"{ss.in_spread_pct:+.3f}%" if ss.in_spread_pct is not None else "N/A"
+        u = f"${ss.in_spread_usd:+.4f}" if ss.in_spread_usd is not None else ""
+        main = (
+            f"🟢 ARB ENTRY SIGNAL\n"
+            f"📈 IN Spread: {p} ({u})\n"
+            f"{cfg.leg_a.display} bid: {a.bid} | {cfg.leg_b.display} ask: {b.ask}\n"
+            f"Fund: A {af} / B {bf}\n"
+            f"⏰ {_ts()}"
         )
-        return
+        follow = f"↗️ STILL OPEN IN {p}"
+    else:
+        p = f"{ss.out_spread_pct:+.3f}%" if ss.out_spread_pct is not None else "N/A"
+        u = f"${ss.out_spread_usd:+.4f}" if ss.out_spread_usd is not None else ""
+        emoji = "🚨" if ch == "OUT_MAX" else "🔴"
+        label = "EXTREME EXIT" if ch == "OUT_MAX" else "ARB EXIT SIGNAL"
+        main = (
+            f"{emoji} {label}\n"
+            f"📉 OUT Spread: {p} ({u})\n"
+            f"{cfg.leg_b.display} bid: {b.bid} | {cfg.leg_a.display} ask: {a.ask}\n"
+            f"Fund: A {af} / B {bf}\n"
+            f"⏰ {_ts()}"
+        )
+        follow = f"↘️ STILL OPEN OUT {p}"
+    await _safe_send(bot, cid, main)
+    await asyncio.sleep(0.1)
+    await _safe_send(bot, cid, follow)
+
+
+async def _send_oi_alert(bot, cid, cfg: SpreadConfig, oi: float) -> None:
+    await _safe_send(bot, cid, f"⚡ HIGH OI  ${oi/1e6:.2f}M\n{cfg.name}\n⏰ {_ts()}")
+    await asyncio.sleep(0.1)
+    await _safe_send(bot, cid, f"⚡ OI STILL ${oi/1e6:.2f}M")
+
+
+async def _safe_send(bot, cid, text) -> None:
     try:
-        val = float(ctx.args[0])
-    except ValueError:
-        await update.effective_chat.send_message("Could not parse number.")
-        return
-    rt = await state.get_or_create(store, update.effective_chat.id)
-    rt.cfg.out_min_depth = val
-    await store.upsert(rt.cfg)
-    await update.effective_chat.send_message(
-        f"OUT min depth set to {val} coins (range -{OUT_DEPTH_RANGE_PCT}%)"
-    )
-
-
-async def cmd_set_oi(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None:
-        return
-    bd = _bot_data(ctx)
-    state: BotState = bd["state"]
-    store: ConfigStore = bd["store"]
-    if not ctx.args:
-        await update.effective_chat.send_message("Usage: /set_oi <millions>  (e.g. /set_oi 6.9)")
-        return
-    try:
-        val = float(ctx.args[0]) * 1_000_000
-    except ValueError:
-        await update.effective_chat.send_message("Could not parse number.")
-        return
-    rt = await state.get_or_create(store, update.effective_chat.id)
-    rt.cfg.oi_threshold = val
-    await store.upsert(rt.cfg)
-    await update.effective_chat.send_message(f"OI threshold set to {_fmt_oi(val)}")
-
-
-async def cmd_thresholds(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat is None:
-        return
-    bd = _bot_data(ctx)
-    state: BotState = bd["state"]
-    store: ConfigStore = bd["store"]
-    rt = await state.get_or_create(store, update.effective_chat.id)
-    await update.effective_chat.send_message(
-        f"IN  threshold: {rt.cfg.in_threshold:.3f}%\n"
-        f"OUT threshold: {rt.cfg.out_threshold:.3f}%\n"
-        f"OUT max threshold: {rt.cfg.out_max_threshold:.3f}%\n"
-        f"OI threshold: {_fmt_oi(rt.cfg.oi_threshold)}\n"
-        f"OUT min depth: {rt.cfg.out_min_depth} coins (range -{OUT_DEPTH_RANGE_PCT}%)"
-    )
-
-
-async def _set_alerts(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, on: bool
-) -> None:
-    if update.effective_chat is None:
-        return
-    bd = _bot_data(ctx)
-    state: BotState = bd["state"]
-    store: ConfigStore = bd["store"]
-    rt = await state.get_or_create(store, update.effective_chat.id)
-    rt.cfg.alerts_on = on
-    await store.upsert(rt.cfg)
-    await update.effective_chat.send_message(f"Alerts {'ON' if on else 'OFF'}.")
-
-
-async def cmd_alerts_on(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_alerts(update, ctx, True)
-
-
-async def cmd_alerts_off(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_alerts(update, ctx, False)
-
-
-# ----------------------------------------------------------------- dispatcher
-
-
-async def _safe_send(bot, chat_id: int, text: str) -> None:
-    try:
-        await bot.send_message(chat_id=chat_id, text=text)
+        await bot.send_message(cid, text)
     except RetryAfter as e:
-        log.warning("rate limited; sleeping %s", e.retry_after)
-        await asyncio.sleep(float(e.retry_after) + 0.5)
-        try:
-            await bot.send_message(chat_id=chat_id, text=text)
-        except TelegramError as e2:
-            log.warning("retry send failed: %s", e2)
+        await asyncio.sleep(e.retry_after)
+        await bot.send_message(cid, text)
     except TelegramError as e:
-        log.warning("telegram send failed for chat %s: %s", chat_id, e)
+        log.warning("send error %s: %s", cid, e)
 
 
-async def alert_dispatcher(app: Application, feed: PriceFeed, state: BotState) -> None:
-    """Single global loop polling the feed once per second and fanning out per chat.
+# ─────────────────────────────────────────── entry point
 
-    User explicitly asked for spammy alerts (wake them up):
-    - re-fires every ALERT_REFIRE_INTERVAL_S while breached
-    - sends the main alert + a short follow-up so the phone double-buzzes
-    - no hysteresis dead-zone: stays "breached" until pct drops below threshold
-    """
-    bot = app.bot
-    while True:
-        try:
-            snap = await feed.snapshot()
-        except Exception as e:
-            log.warning("snapshot error: %s", e)
-            await asyncio.sleep(ALERT_POLL_INTERVAL_S)
-            continue
-
-        in_pct = snap["in_spread_pct"]
-        out_pct = snap["out_spread_pct"]
-        oi_usd = snap.get("hl_oi_usd")
-        now = time.monotonic()
-
-        async with state.lock:
-            chats = list(state.chats.values())
-
-        for rt in chats:
-            if not rt.cfg.alerts_on:
-                for s in (rt.in_state, rt.out_state, rt.out_max_state, rt.oi_state):
-                    s.breached = False
-                continue
-
-            # IN spread
-            if in_pct is not None and in_pct >= rt.cfg.in_threshold:
-                rt.in_state.breached = True
-                if now - rt.in_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
-                    rt.in_state.last_fired = now
-                    await _safe_send(bot, rt.cfg.chat_id, fmt_in_alert(snap))
-                    await _safe_send(bot, rt.cfg.chat_id,
-                        f"🚨 STILL ACTIVE — IN {_fmt_pct(in_pct)} ≥ thr {rt.cfg.in_threshold:.3f}%")
-            else:
-                rt.in_state.breached = False
-
-            # depth: coins available within the -OUT_DEPTH_RANGE_PCT% exit spread zone
-            gate_ask = snap["gate"]["ask"] or 0.0
-            hl_bid   = snap["hl"]["bid"]   or 0.0
-            hl_depth   = PriceFeed.hl_out_depth(snap.get("hl_bids", []),   gate_ask, OUT_DEPTH_RANGE_PCT)
-            gate_depth = PriceFeed.gate_out_depth(snap.get("gate_asks", []), hl_bid,  OUT_DEPTH_RANGE_PCT)
-            depth_ok = hl_depth >= rt.cfg.out_min_depth and gate_depth >= rt.cfg.out_min_depth
-
-            # OUT spread (lower threshold) — only fires when both depth conditions met
-            if out_pct is not None and out_pct >= rt.cfg.out_threshold and depth_ok:
-                rt.out_state.breached = True
-                if now - rt.out_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
-                    rt.out_state.last_fired = now
-                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_alert(snap, hl_depth, gate_depth))
-                    await _safe_send(bot, rt.cfg.chat_id,
-                        f"🚨 STILL ACTIVE — OUT {_fmt_pct(out_pct)} ≥ thr {rt.cfg.out_threshold:.3f}% | HL {hl_depth:.2f} / Gate {gate_depth:.2f}")
-            else:
-                rt.out_state.breached = False
-
-            # OUT spread (upper / extreme threshold) — also gated on depth
-            if out_pct is not None and out_pct >= rt.cfg.out_max_threshold and depth_ok:
-                rt.out_max_state.breached = True
-                if now - rt.out_max_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
-                    rt.out_max_state.last_fired = now
-                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_max_alert(snap, hl_depth, gate_depth))
-                    await _safe_send(bot, rt.cfg.chat_id,
-                        f"🚨🚨 EXTREME OUT — {_fmt_pct(out_pct)} ≥ max {rt.cfg.out_max_threshold:.3f}% | HL {hl_depth:.2f} / Gate {gate_depth:.2f}")
-            else:
-                rt.out_max_state.breached = False
-
-            # OI threshold
-            if oi_usd is not None and oi_usd >= rt.cfg.oi_threshold:
-                rt.oi_state.breached = True
-                if now - rt.oi_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
-                    rt.oi_state.last_fired = now
-                    await _safe_send(bot, rt.cfg.chat_id, fmt_oi_alert(snap, rt.cfg.oi_threshold))
-                    await _safe_send(bot, rt.cfg.chat_id,
-                        f"🚨 OI STILL HIGH — {_fmt_oi(oi_usd)} ≥ {_fmt_oi(rt.cfg.oi_threshold)}")
-            else:
-                rt.oi_state.breached = False
-
-        await asyncio.sleep(ALERT_POLL_INTERVAL_S)
-
-
-# ----------------------------------------------------------------- lifecycle
-
-
-async def _post_init(app: Application) -> None:
-    feed: PriceFeed = app.bot_data["feed"]
-    state: BotState = app.bot_data["state"]
-    store = await build_config_store()
-    app.bot_data["store"] = store
-    await feed.start()
-    await state.hydrate(store)
-    app.bot_data["dispatcher_task"] = asyncio.create_task(
-        alert_dispatcher(app, feed, state)
-    )
-    log.info("bot ready; %d chat(s) loaded from Redis", len(state.chats))
-    # notify all registered chats that the bot is live again
-    if state.chats:
-        async with state.lock:
-            chat_ids = [rt.cfg.chat_id for rt in state.chats.values()]
-        for cid in chat_ids:
-            try:
-                await app.bot.send_message(
-                    chat_id=cid,
-                    text=f"✅ Bot restarted — monitoring ANTHROPIC spreads.\n{len(chat_ids)} chat(s) active.",
-                )
-            except Exception as e:
-                log.warning("restart notify failed for %s: %s", cid, e)
-
-
-async def _post_shutdown(app: Application) -> None:
-    task: asyncio.Task = app.bot_data.get("dispatcher_task")
-    if task is not None:
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-    feed: PriceFeed = app.bot_data.get("feed")
-    if feed is not None:
-        await feed.stop()
-    store: ConfigStore = app.bot_data.get("store")
-    if store is not None:
-        await store.close()
-
-
-def main() -> None:
-    load_dotenv()
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+async def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise SystemExit("TELEGRAM_BOT_TOKEN missing — set it in .env or env vars")
+        raise SystemExit("TELEGRAM_BOT_TOKEN not set")
 
-    app: Application = (
-        ApplicationBuilder()
+    redis_url = os.getenv("REDIS_URL", "").strip()
+    if not redis_url:
+        raise SystemExit("REDIS_URL not set")
+
+    try:
+        rc = redis_from_url(redis_url, decode_responses=True)
+        await rc.ping()
+    except Exception as e:
+        raise SystemExit(f"Redis error: {e}") from e
+
+    store = RedisStore(rc)
+    session = aiohttp.ClientSession()
+    feed = FeedManager()
+    await feed.start(session)
+
+    bot_core = SpreadBot(token, store, feed)
+
+    app = (
+        Application.builder()
         .token(token)
-        .post_init(_post_init)
-        .post_shutdown(_post_shutdown)
+        .post_init(bot_core._post_init)
         .build()
     )
 
-    feed = PriceFeed()
-    state = BotState()
-    app.bot_data["feed"] = feed
-    app.bot_data["state"] = state
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("newspread", bot_core.cmd_newspread)],
+        states={
+            ASK_URL_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_url_a)],
+            ASK_URL_B: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_url_b)],
+        },
+        fallbacks=[CommandHandler("cancel", bot_core.conv_cancel)],
+    )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("set_in", cmd_set_in))
-    app.add_handler(CommandHandler("set_out", cmd_set_out))
-    app.add_handler(CommandHandler("set_outmax", cmd_set_outmax))
-    app.add_handler(CommandHandler("set_oi", cmd_set_oi))
-    app.add_handler(CommandHandler("set_out_depth", cmd_set_out_depth))
-    app.add_handler(CommandHandler("thresholds", cmd_thresholds))
-    app.add_handler(CommandHandler("alerts_on", cmd_alerts_on))
-    app.add_handler(CommandHandler("alerts_off", cmd_alerts_off))
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("start",          bot_core.cmd_start))
+    app.add_handler(CommandHandler("help",           bot_core.cmd_help))
+    app.add_handler(CommandHandler("spreads",        bot_core.cmd_spreads))
+    app.add_handler(CommandHandler("status",         bot_core.cmd_status))
+    app.add_handler(CommandHandler("set_in",         bot_core.cmd_set_in))
+    app.add_handler(CommandHandler("set_out",        bot_core.cmd_set_out))
+    app.add_handler(CommandHandler("set_outmax",     bot_core.cmd_set_outmax))
+    app.add_handler(CommandHandler("set_oi",         bot_core.cmd_set_oi))
+    app.add_handler(CommandHandler("set_out_depth",  bot_core.cmd_set_out_depth))
+    app.add_handler(CommandHandler("thresholds",     bot_core.cmd_thresholds))
+    app.add_handler(CommandHandler("alerts_on",      bot_core.cmd_alerts_on))
+    app.add_handler(CommandHandler("alerts_off",     bot_core.cmd_alerts_off))
+    app.add_handler(CallbackQueryHandler(bot_core.cb_query))
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    log.info("Bot starting…")
+    await app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
