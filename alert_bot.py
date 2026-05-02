@@ -736,10 +736,9 @@ class SpreadBot:
                 InlineKeyboardButton(al, callback_data=f"toggle:{sid}"),
                 InlineKeyboardButton(pu, callback_data=f"push_toggle:{sid}"),
             ],
-            # Terminal + Delete
+            # Delete full width
             [
-                InlineKeyboardButton("📺 Terminal", callback_data=f"terminal:{sid}"),
-                InlineKeyboardButton("🗑 Delete",   callback_data=f"del:{sid}"),
+                InlineKeyboardButton("🗑 Видалити спред", callback_data=f"del:{sid}"),
             ],
         ])
 
