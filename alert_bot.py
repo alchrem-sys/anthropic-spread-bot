@@ -439,6 +439,24 @@ class SpreadBot:
         ss = self.feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
         await u.message.reply_text(_fmt_status(cfg, ss), parse_mode=ParseMode.MARKDOWN)
 
+    # ─── /debug — show exchange connection state
+
+    async def cmd_debug(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        cid = u.effective_chat.id
+        cfg = self._selected(cid)
+        lines = ["*Exchange connection state*\n"]
+        mgr = self.feed
+        for (ex_name, mt), ex in mgr._exchanges.items():
+            for sym, state in ex._state.items():
+                ts = state.get("ts", 0.0)
+                age = time.monotonic() - ts if ts else None
+                stale = age is None or age > 3.0
+                status = f"⚠️ STALE ({age:.0f}s ago)" if stale and age else "⚠️ NO DATA YET" if stale else f"✅ LIVE ({age:.1f}s)"
+                lines.append(f"`{ex_name}/{mt}` `{sym}`: {status}")
+        if cfg:
+            lines.append(f"\nSelected: *{cfg.name}*")
+        await u.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
     # ─── threshold setters
 
     async def _set_field(self, u: Update, c: ContextTypes.DEFAULT_TYPE,
@@ -696,6 +714,7 @@ def main() -> None:
     app.add_handler(CommandHandler("thresholds",     bot_core.cmd_thresholds))
     app.add_handler(CommandHandler("alerts_on",      bot_core.cmd_alerts_on))
     app.add_handler(CommandHandler("alerts_off",     bot_core.cmd_alerts_off))
+    app.add_handler(CommandHandler("debug",          bot_core.cmd_debug))
     app.add_handler(CallbackQueryHandler(bot_core.cb_query))
 
     log.info("Bot starting…")

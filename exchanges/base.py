@@ -109,11 +109,13 @@ class Exchange:
         while not self._stop.is_set():
             try:
                 url = self._ws_url()
+                self.log.info("ws connecting: %s…", url[:80])
                 async with websockets.connect(
                     url, ping_interval=20, ping_timeout=20,
                     additional_headers=self._ws_headers(),
                 ) as ws:
                     self._ws = ws
+                    self.log.info("ws connected: %s  symbols=%s", self.name, list(self._symbols))
                     for sym in list(self._symbols):
                         for msg in self._subscribe_msgs(sym):
                             await ws.send(__import__("json").dumps(msg))
@@ -135,11 +137,12 @@ class Exchange:
                                 for st in self._state.values():
                                     self._parse(msg, st)
             except (ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-                self.log.warning("ws disconnected: %s", e)
+                self.log.warning("ws disconnected [%s]: %s  (retry in %.0fs)",
+                                 self.name, e, backoff)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.log.exception("ws error: %s", e)
+                self.log.exception("ws error [%s]: %s", self.name, e)
             finally:
                 self._ws = None
             await asyncio.sleep(backoff)
@@ -148,6 +151,8 @@ class Exchange:
     # ---------------------------------------------------------------- REST fallback
 
     async def _rest_loop(self) -> None:
+        # track consecutive REST failures per symbol to avoid log spam
+        _fail_counts: dict[str, int] = {}
         while not self._stop.is_set():
             for sym in list(self._symbols):
                 s = self._state.get(sym)
@@ -158,12 +163,22 @@ class Exchange:
                     try:
                         assert self._session is not None
                         data = await self._rest_snapshot(sym, self._session)
-                        async with self._lock:
-                            s.update(data)
+                        if data:
+                            async with self._lock:
+                                s.update(data)
+                            _fail_counts[sym] = 0
+                        else:
+                            _fail_counts[sym] = _fail_counts.get(sym, 0) + 1
+                            if _fail_counts[sym] <= 3:
+                                self.log.warning("rest empty response [%s/%s]", self.name, sym)
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
-                        self.log.debug("rest fallback error for %s: %s", sym, e)
+                        _fail_counts[sym] = _fail_counts.get(sym, 0) + 1
+                        # log first 3 failures verbosely, then every 30th
+                        if _fail_counts[sym] <= 3 or _fail_counts[sym] % 30 == 0:
+                            self.log.warning("rest error [%s/%s] #%d: %s",
+                                             self.name, sym, _fail_counts[sym], e)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=REST_POLL_INTERVAL_S)
             except asyncio.TimeoutError:
