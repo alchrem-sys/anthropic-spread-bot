@@ -39,6 +39,8 @@ DEFAULT_IN_THRESHOLD = 0.3
 DEFAULT_OUT_THRESHOLD = 0.3
 DEFAULT_OUT_MAX_THRESHOLD = 20.0
 DEFAULT_OI_THRESHOLD = 6_900_000.0
+DEFAULT_OUT_MIN_DEPTH = 0.5        # min coins in HL bid book within depth range
+OUT_DEPTH_RANGE_PCT = 4.5          # look this far below best HL bid
 ALERT_POLL_INTERVAL_S = 1.0
 ALERT_REFIRE_INTERVAL_S = 3.0  # spam cadence while breached
 
@@ -53,6 +55,7 @@ class ChatConfig:
     out_threshold: float = DEFAULT_OUT_THRESHOLD
     out_max_threshold: float = DEFAULT_OUT_MAX_THRESHOLD
     oi_threshold: float = DEFAULT_OI_THRESHOLD
+    out_min_depth: float = DEFAULT_OUT_MIN_DEPTH
     alerts_on: bool = True
 
 
@@ -94,6 +97,7 @@ class JsonConfigStore(ConfigStore):
                     out_threshold=float(v.get("out_threshold", DEFAULT_OUT_THRESHOLD)),
                     out_max_threshold=float(v.get("out_max_threshold", DEFAULT_OUT_MAX_THRESHOLD)),
                     oi_threshold=float(v.get("oi_threshold", DEFAULT_OI_THRESHOLD)),
+                    out_min_depth=float(v.get("out_min_depth", DEFAULT_OUT_MIN_DEPTH)),
                     alerts_on=bool(v.get("alerts_on", True)),
                 )
             except (TypeError, ValueError):
@@ -117,6 +121,7 @@ class JsonConfigStore(ConfigStore):
             "out_threshold": cfg.out_threshold,
             "out_max_threshold": cfg.out_max_threshold,
             "oi_threshold": cfg.oi_threshold,
+            "out_min_depth": cfg.out_min_depth,
             "alerts_on": cfg.alerts_on,
         }
         tmp = self.path + ".tmp"
@@ -156,6 +161,7 @@ class RedisConfigStore(ConfigStore):
                 out_threshold=float(data.get("out_threshold", DEFAULT_OUT_THRESHOLD)),
                 out_max_threshold=float(data.get("out_max_threshold", DEFAULT_OUT_MAX_THRESHOLD)),
                 oi_threshold=float(data.get("oi_threshold", DEFAULT_OI_THRESHOLD)),
+                out_min_depth=float(data.get("out_min_depth", DEFAULT_OUT_MIN_DEPTH)),
                 alerts_on=data.get("alerts_on", "1") not in ("0", "false", "False"),
             )
         return out
@@ -169,6 +175,7 @@ class RedisConfigStore(ConfigStore):
                 "out_threshold": str(cfg.out_threshold),
                 "out_max_threshold": str(cfg.out_max_threshold),
                 "oi_threshold": str(cfg.oi_threshold),
+                "out_min_depth": str(cfg.out_min_depth),
                 "alerts_on": "1" if cfg.alerts_on else "0",
             },
         )
@@ -278,13 +285,14 @@ def fmt_in_alert(snap: dict) -> str:
     )
 
 
-def fmt_out_alert(snap: dict) -> str:
+def fmt_out_alert(snap: dict, depth: float) -> str:
     g = snap["gate"]
     h = snap["hl"]
     return (
         "🔴 ARB EXIT SIGNAL — ANTHROPIC\n"
         f"📉 OUT Spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})\n"
         f"HL bid: {_fmt_price(h['bid'])} | Gate ask: {_fmt_price(g['ask'])}\n"
+        f"HL bid depth (-{OUT_DEPTH_RANGE_PCT}%): {depth:.3f} coins\n"
         f"Fund diff: Gate {_fmt_funding(g['funding'])} / HL {_fmt_funding(h['funding'])}\n"
         f"⏰ {_now_utc_str()}"
     )
@@ -296,13 +304,14 @@ def _fmt_oi(v: Optional[float]) -> str:
     return f"${v / 1_000_000:.3f}M"
 
 
-def fmt_out_max_alert(snap: dict) -> str:
+def fmt_out_max_alert(snap: dict, depth: float) -> str:
     g = snap["gate"]
     h = snap["hl"]
     return (
         "🔴🔴 OUT SPREAD EXTREME — ANTHROPIC\n"
         f"📉 OUT Spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})\n"
         f"HL bid: {_fmt_price(h['bid'])} | Gate ask: {_fmt_price(g['ask'])}\n"
+        f"HL bid depth (-{OUT_DEPTH_RANGE_PCT}%): {depth:.3f} coins\n"
         f"Fund diff: Gate {_fmt_funding(g['funding'])} / HL {_fmt_funding(h['funding'])}\n"
         f"⏰ {_now_utc_str()}"
     )
@@ -329,6 +338,9 @@ def fmt_status(snap: dict, cfg: ChatConfig) -> str:
         f"HyperLiq bid={_fmt_price(h['bid'])} ask={_fmt_price(h['ask'])} "
         f"fund={_fmt_funding(h['funding'])} OI={_fmt_oi(snap.get('hl_oi_usd'))} "
         f"{'STALE' if snap['hl_stale'] else 'LIVE'}\n"
+        f"HL bid depth (-{OUT_DEPTH_RANGE_PCT}%): "
+        f"{PriceFeed.bid_depth_within_pct(snap.get('hl_bids', []), OUT_DEPTH_RANGE_PCT):.3f} coins "
+        f"(min {cfg.out_min_depth})\n"
         f"\nIN  spread: {_fmt_pct(snap['in_spread_pct'])} ({_fmt_usd(snap['in_spread_usd'])})  "
         f"thr={cfg.in_threshold:.3f}%\n"
         f"OUT spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})  "
@@ -358,8 +370,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"OUT threshold: {rt.cfg.out_threshold:.3f}%\n"
         f"OUT max threshold: {rt.cfg.out_max_threshold:.3f}%\n"
         f"OI threshold: {_fmt_oi(rt.cfg.oi_threshold)}\n"
+        f"OUT min depth: {rt.cfg.out_min_depth} coins (range -{OUT_DEPTH_RANGE_PCT}%)\n"
         f"Alerts: {'ON' if rt.cfg.alerts_on else 'OFF'}\n\n"
-        "Commands: /status /set_in /set_out /set_outmax /set_oi /thresholds /alerts_on /alerts_off /help"
+        "Commands: /status /set_in /set_out /set_outmax /set_oi /set_out_depth /thresholds /alerts_on /alerts_off /help"
     )
 
 
@@ -374,6 +387,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/set_out <pct> — set OUT spread lower threshold\n"
         "/set_outmax <pct> — set OUT spread upper threshold (e.g. /set_outmax 20)\n"
         "/set_oi <millions> — set OI alert threshold in $M (e.g. /set_oi 6.9)\n"
+        f"/set_out_depth <coins> — min HL bid depth within -{OUT_DEPTH_RANGE_PCT}% for OUT alert (e.g. /set_out_depth 0.5)\n"
         "/thresholds — show all thresholds\n"
         "/alerts_on — enable alerts in this chat\n"
         "/alerts_off — disable alerts in this chat\n"
@@ -434,6 +448,31 @@ async def cmd_set_outmax(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await _set_pct_threshold(update, ctx, "OUT_MAX")
 
 
+async def cmd_set_out_depth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat is None:
+        return
+    bd = _bot_data(ctx)
+    state: BotState = bd["state"]
+    store: ConfigStore = bd["store"]
+    if not ctx.args:
+        await update.effective_chat.send_message(
+            f"Usage: /set_out_depth <coins>  (e.g. /set_out_depth 0.5)\n"
+            f"OUT alerts only fire when HL bid depth within -{OUT_DEPTH_RANGE_PCT}% ≥ this value."
+        )
+        return
+    try:
+        val = float(ctx.args[0])
+    except ValueError:
+        await update.effective_chat.send_message("Could not parse number.")
+        return
+    rt = await state.get_or_create(store, update.effective_chat.id)
+    rt.cfg.out_min_depth = val
+    await store.upsert(rt.cfg)
+    await update.effective_chat.send_message(
+        f"OUT min depth set to {val} coins (range -{OUT_DEPTH_RANGE_PCT}%)"
+    )
+
+
 async def cmd_set_oi(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat is None:
         return
@@ -465,7 +504,8 @@ async def cmd_thresholds(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         f"IN  threshold: {rt.cfg.in_threshold:.3f}%\n"
         f"OUT threshold: {rt.cfg.out_threshold:.3f}%\n"
         f"OUT max threshold: {rt.cfg.out_max_threshold:.3f}%\n"
-        f"OI threshold: {_fmt_oi(rt.cfg.oi_threshold)}"
+        f"OI threshold: {_fmt_oi(rt.cfg.oi_threshold)}\n"
+        f"OUT min depth: {rt.cfg.out_min_depth} coins (range -{OUT_DEPTH_RANGE_PCT}%)"
     )
 
 
@@ -550,25 +590,29 @@ async def alert_dispatcher(app: Application, feed: PriceFeed, state: BotState) -
             else:
                 rt.in_state.breached = False
 
-            # OUT spread (lower threshold)
-            if out_pct is not None and out_pct >= rt.cfg.out_threshold:
+            # depth check — shared by both OUT alerts
+            depth = PriceFeed.bid_depth_within_pct(snap.get("hl_bids", []), OUT_DEPTH_RANGE_PCT)
+            depth_ok = depth >= rt.cfg.out_min_depth
+
+            # OUT spread (lower threshold) — only fires when depth condition met
+            if out_pct is not None and out_pct >= rt.cfg.out_threshold and depth_ok:
                 rt.out_state.breached = True
                 if now - rt.out_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
                     rt.out_state.last_fired = now
-                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_alert(snap))
+                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_alert(snap, depth))
                     await _safe_send(bot, rt.cfg.chat_id,
-                        f"🚨 STILL ACTIVE — OUT {_fmt_pct(out_pct)} ≥ thr {rt.cfg.out_threshold:.3f}%")
+                        f"🚨 STILL ACTIVE — OUT {_fmt_pct(out_pct)} ≥ thr {rt.cfg.out_threshold:.3f}% | depth {depth:.3f}")
             else:
                 rt.out_state.breached = False
 
-            # OUT spread (upper / extreme threshold)
-            if out_pct is not None and out_pct >= rt.cfg.out_max_threshold:
+            # OUT spread (upper / extreme threshold) — also gated on depth
+            if out_pct is not None and out_pct >= rt.cfg.out_max_threshold and depth_ok:
                 rt.out_max_state.breached = True
                 if now - rt.out_max_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
                     rt.out_max_state.last_fired = now
-                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_max_alert(snap))
+                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_max_alert(snap, depth))
                     await _safe_send(bot, rt.cfg.chat_id,
-                        f"🚨🚨 EXTREME OUT — {_fmt_pct(out_pct)} ≥ max {rt.cfg.out_max_threshold:.3f}%")
+                        f"🚨🚨 EXTREME OUT — {_fmt_pct(out_pct)} ≥ max {rt.cfg.out_max_threshold:.3f}% | depth {depth:.3f}")
             else:
                 rt.out_max_state.breached = False
 
@@ -648,6 +692,7 @@ def main() -> None:
     app.add_handler(CommandHandler("set_out", cmd_set_out))
     app.add_handler(CommandHandler("set_outmax", cmd_set_outmax))
     app.add_handler(CommandHandler("set_oi", cmd_set_oi))
+    app.add_handler(CommandHandler("set_out_depth", cmd_set_out_depth))
     app.add_handler(CommandHandler("thresholds", cmd_thresholds))
     app.add_handler(CommandHandler("alerts_on", cmd_alerts_on))
     app.add_handler(CommandHandler("alerts_off", cmd_alerts_off))

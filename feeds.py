@@ -44,7 +44,8 @@ class PriceFeed:
         self._lock = asyncio.Lock()
         self._prices: dict[str, dict[str, Any]] = {
             "gate": {"bid": None, "ask": None, "funding": None, "ts": None},
-            "hl": {"bid": None, "ask": None, "funding": None, "oi": None, "mark_px": None, "ts": None},
+            "hl": {"bid": None, "ask": None, "funding": None, "oi": None, "mark_px": None,
+                   "bids": [], "ts": None},
         }
         self._tasks: list[asyncio.Task] = []
         self._session: Optional[aiohttp.ClientSession] = None
@@ -105,6 +106,7 @@ class PriceFeed:
         oi = hl.get("oi")
         mark = hl.get("mark_px")
         snap["hl_oi_usd"] = float(oi) * float(mark) if oi is not None and mark is not None else None
+        snap["hl_bids"] = list(hl.get("bids") or [])
         return snap
 
     async def _set(
@@ -116,6 +118,7 @@ class PriceFeed:
         funding: Optional[float] = None,
         oi: Optional[float] = None,
         mark_px: Optional[float] = None,
+        bids: Optional[list] = None,
         touch_ts: bool = True,
     ) -> None:
         async with self._lock:
@@ -130,8 +133,11 @@ class PriceFeed:
                 p["oi"] = oi
             if mark_px is not None:
                 p["mark_px"] = mark_px
+            if bids is not None:
+                p["bids"] = bids
             if touch_ts and (bid is not None or ask is not None):
                 p["ts"] = time.monotonic()
+
 
     # ------------------------------------------------------------------ Gate
 
@@ -240,12 +246,13 @@ class PriceFeed:
         levels = data.get("levels") or []
         if len(levels) < 2:
             return
-        bids = levels[0]
+        raw_bids = levels[0]
         asks = levels[1]
-        bid = float(bids[0]["px"]) if bids else None
+        bid = float(raw_bids[0]["px"]) if raw_bids else None
         ask = float(asks[0]["px"]) if asks else None
+        parsed_bids = [{"px": float(b["px"]), "sz": float(b["sz"])} for b in raw_bids]
         if bid is not None or ask is not None:
-            await self._set("hl", bid=bid, ask=ask)
+            await self._set("hl", bid=bid, ask=ask, bids=parsed_bids)
 
     async def _run_hl_funding_poll(self) -> None:
         while not self._stop.is_set():
@@ -348,12 +355,24 @@ class PriceFeed:
         levels = body.get("levels") or []
         if len(levels) < 2:
             return
-        bids = levels[0]
+        raw_bids = levels[0]
         asks = levels[1]
-        bid = float(bids[0]["px"]) if bids else None
+        bid = float(raw_bids[0]["px"]) if raw_bids else None
         ask = float(asks[0]["px"]) if asks else None
+        parsed_bids = [{"px": float(b["px"]), "sz": float(b["sz"])} for b in raw_bids]
         if bid is not None or ask is not None:
-            await self._set("hl", bid=bid, ask=ask)
+            await self._set("hl", bid=bid, ask=ask, bids=parsed_bids)
+
+    # ----------------------------------------------------------------- depth util
+
+    @staticmethod
+    def bid_depth_within_pct(bids: list[dict], range_pct: float) -> float:
+        """Sum of bid sizes where price >= best_bid * (1 - range_pct/100)."""
+        if not bids:
+            return 0.0
+        best = bids[0]["px"]
+        cutoff = best * (1.0 - range_pct / 100.0)
+        return sum(b["sz"] for b in bids if b["px"] >= cutoff)
 
     # ----------------------------------------------------------------- smoke test
 
