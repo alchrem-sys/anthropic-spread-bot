@@ -36,6 +36,15 @@ class HyperliquidFutures(Exchange):
             asyncio.create_task(self._funding_loop(), name=f"{self.name}_funding"),
         ]
 
+    def _ws_connect_kwargs(self) -> dict:
+        # HL doesn't support WS-level ping frames; it uses JSON {"method":"ping"}
+        return {"ping_interval": None, "ping_timeout": None}
+
+    async def _on_ws_msg(self, ws, msg: dict) -> None:
+        if msg.get("method") == "ping":
+            import json as _json
+            await ws.send(_json.dumps({"method": "pong"}))
+
     def _ws_url(self) -> str:
         return HL_WS_URL
 

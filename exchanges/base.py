@@ -112,8 +112,10 @@ class Exchange:
                 url = self._ws_url()
                 self.log.info("ws connecting: %s…", url[:80])
                 async with websockets.connect(
-                    url, ping_interval=20, ping_timeout=20,
+                    url,
                     additional_headers=self._ws_headers(),
+                    **{"ping_interval": 20, "ping_timeout": 20,
+                       **self._ws_connect_kwargs()},
                 ) as ws:
                     self._ws = ws
                     self.log.info("ws connected: %s  symbols=%s", self.name, list(self._symbols))
@@ -138,6 +140,7 @@ class Exchange:
                             msg = __import__("json").loads(raw)
                         except Exception:
                             continue
+                        await self._on_ws_msg(ws, msg)
                         sym = self._msg_symbol(msg)
                         if sym and sym in self._state:
                             async with self._lock:
@@ -202,6 +205,14 @@ class Exchange:
 
     def _ws_headers(self) -> dict:
         return {}
+
+    def _ws_connect_kwargs(self) -> dict:
+        """Extra kwargs for websockets.connect (overrides defaults)."""
+        return {}
+
+    async def _on_ws_msg(self, ws, msg: dict) -> None:
+        """Hook called for every incoming WS message. Override for JSON ping/pong etc."""
+        pass
 
     def _subscribe_msgs(self, symbol: str) -> list[dict]:
         raise NotImplementedError

@@ -337,24 +337,33 @@ async def render_loop(
             pass
 
 
+async def _load_spread_from_redis(redis_client, feed: FeedManager, state: MonitorState, sid: str) -> bool:
+    h = await redis_client.hgetall(f"spread:{sid}")
+    if not h:
+        return False
+    new_a = ExchangeInfo(h["leg_a_ex"], h["leg_a_sym"], h["leg_a_mt"], h["leg_a_disp"])
+    new_b = ExchangeInfo(h["leg_b_ex"], h["leg_b_sym"], h["leg_b_mt"], h["leg_b_disp"])
+    await feed.subscribe(new_a)
+    await feed.subscribe(new_b)
+    state.leg_a = new_a
+    state.leg_b = new_b
+    state.in_alert = AlertState()
+    state.out_alert = AlertState()
+    return True
+
+
 async def redis_watcher(redis_client, feed: FeedManager, state: MonitorState) -> None:
-    """Poll Redis for active spread changes every 2s."""
+    """Poll Redis for active spread changes every 2s (watches both sid and ts counter)."""
     last_sid: Optional[str] = None
+    last_ts: Optional[str] = None
     while True:
         try:
             sid = await redis_client.get("monitor:active_spread")
-            if sid and sid != last_sid:
-                h = await redis_client.hgetall(f"spread:{sid}")
-                if h:
-                    new_a = ExchangeInfo(h["leg_a_ex"], h["leg_a_sym"], h["leg_a_mt"], h["leg_a_disp"])
-                    new_b = ExchangeInfo(h["leg_b_ex"], h["leg_b_sym"], h["leg_b_mt"], h["leg_b_disp"])
-                    await feed.subscribe(new_a)
-                    await feed.subscribe(new_b)
-                    state.leg_a = new_a
-                    state.leg_b = new_b
-                    state.in_alert = AlertState()
-                    state.out_alert = AlertState()
+            ts  = await redis_client.get("monitor:active_spread_ts")
+            if sid and (sid != last_sid or ts != last_ts):
+                if await _load_spread_from_redis(redis_client, feed, state, sid):
                     last_sid = sid
+                    last_ts = ts
         except Exception:
             pass
         await asyncio.sleep(2.0)
@@ -405,17 +414,10 @@ async def main_async(args: argparse.Namespace) -> None:
             })
             await redis_client.set("monitor:active_spread", sid_placeholder)
     elif redis_client:
-        # Load active spread from Redis
-        sid = await redis_client.get("monitor:active_spread")
+        # --spread <id> takes priority, else use monitor:active_spread
+        sid = args.spread or await redis_client.get("monitor:active_spread")
         if sid:
-            h = await redis_client.hgetall(f"spread:{sid}")
-            if h:
-                la = ExchangeInfo(h["leg_a_ex"], h["leg_a_sym"], h["leg_a_mt"], h["leg_a_disp"])
-                lb = ExchangeInfo(h["leg_b_ex"], h["leg_b_sym"], h["leg_b_mt"], h["leg_b_disp"])
-                await feed.subscribe(la)
-                await feed.subscribe(lb)
-                state.leg_a = la
-                state.leg_b = lb
+            await _load_spread_from_redis(redis_client, feed, state, sid)
 
     console = Console()
     reader = StdinReader()

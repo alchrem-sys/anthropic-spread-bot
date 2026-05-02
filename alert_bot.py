@@ -55,22 +55,24 @@ ASK_LEG_A_EX, ASK_LEG_A_SYM, ASK_LEG_B_EX, ASK_LEG_B_SYM = range(4)
 
 # ── exchange menu ──────────────────────────────────────────────────────────────
 _EXCHANGES = [
-    ("Gate Futures",     "gate",        "futures"),
-    ("Gate Spot",        "gate",        "spot"),
-    ("Binance Futures",  "binance",     "futures"),
-    ("Binance Spot",     "binance",     "spot"),
-    ("Bybit Futures",    "bybit",       "futures"),
-    ("Bybit Spot",       "bybit",       "spot"),
-    ("OKX Futures",      "okx",         "futures"),
-    ("OKX Spot",         "okx",         "spot"),
-    ("MEXC Futures",     "mexc",        "futures"),
-    ("MEXC Spot",        "mexc",        "spot"),
-    ("KuCoin Futures",   "kucoin",      "futures"),
-    ("KuCoin Spot",      "kucoin",      "spot"),
-    ("Bitget Futures",   "bitget",      "futures"),
-    ("Bitget Spot",      "bitget",      "spot"),
+    # ── Futures first (most common use case) ──────────────────
     ("Aster Futures",    "aster",       "futures"),
     ("Hyperliquid",      "hyperliquid", "futures"),
+    ("Binance Futures",  "binance",     "futures"),
+    ("Bybit Futures",    "bybit",       "futures"),
+    ("Gate Futures",     "gate",        "futures"),
+    ("OKX Futures",      "okx",         "futures"),
+    ("MEXC Futures",     "mexc",        "futures"),
+    ("KuCoin Futures",   "kucoin",      "futures"),
+    ("Bitget Futures",   "bitget",      "futures"),
+    # ── Spot ──────────────────────────────────────────────────
+    ("Binance Spot",     "binance",     "spot"),
+    ("Bybit Spot",       "bybit",       "spot"),
+    ("Gate Spot",        "gate",        "spot"),
+    ("OKX Spot",         "okx",         "spot"),
+    ("MEXC Spot",        "mexc",        "spot"),
+    ("KuCoin Spot",      "kucoin",      "spot"),
+    ("Bitget Spot",      "bitget",      "spot"),
 ]
 
 # ticker format hints shown to the user after exchange selection
@@ -103,10 +105,33 @@ def _ex_keyboard(cb_prefix: str) -> InlineKeyboardMarkup:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
+def _normalize_symbol(exchange: str, market_type: str, symbol: str) -> str:
+    """Convert user-typed symbol to the API format required by each exchange."""
+    sym = symbol.upper()
+    if exchange == "hyperliquid":
+        # HL uses coin names only: "BTCUSDT" → "BTC", "ETHUSDT" → "ETH"
+        for suffix in ("USDT", "USDC", "USD", "PERP"):
+            if sym.endswith(suffix) and len(sym) > len(suffix):
+                return sym[:-len(suffix)]
+    elif exchange == "okx":
+        # OKX uses dash-separated: "LABUSDT" → "LAB-USDT-SWAP" or "LAB-USDT"
+        if "-" not in sym:
+            for quote in ("USDT", "USDC", "BTC", "ETH", "USD"):
+                if sym.endswith(quote) and len(sym) > len(quote):
+                    base = sym[:-len(quote)]
+                    return f"{base}-{quote}-SWAP" if market_type == "futures" else f"{base}-{quote}"
+    elif exchange == "kucoin" and market_type == "futures":
+        # KuCoin futures: needs M suffix — BTCUSDT → BTCUSDTM
+        if not sym.endswith("M"):
+            sym = sym + "M"
+    return sym
+
+
 def _make_info(exchange: str, market_type: str, symbol: str) -> ExchangeInfo:
     label = next((lbl for lbl, ex, mt in _EXCHANGES if ex == exchange and mt == market_type), exchange)
-    return ExchangeInfo(exchange=exchange, symbol=symbol,
-                        market_type=market_type, display=f"{label} · {symbol}")
+    normalized = _normalize_symbol(exchange, market_type, symbol)
+    return ExchangeInfo(exchange=exchange, symbol=normalized,
+                        market_type=market_type, display=f"{label} · {normalized}")
 
 
 # ─────────────────────────────────────────── data models
@@ -228,6 +253,8 @@ class RedisStore:
 
     async def set_monitor_spread(self, sid: str) -> None:
         await self._r.set("monitor:active_spread", sid)
+        # bump a counter so the watcher detects the change even for the same spread
+        await self._r.incr("monitor:active_spread_ts")
 
 
 # ─────────────────────────────────────────── bot
@@ -470,6 +497,24 @@ class SpreadBot:
             if rt.selected_spread_id == sid:
                 rt.selected_spread_id = ids[0] if ids else None
             await q.edit_message_text("🗑 Spread deleted.")
+        elif data == "noop":
+            pass  # label-only button
+        elif data.startswith("adj_in:") or data.startswith("adj_out:"):
+            kind, rest = data.split(":", 1)
+            sid, delta_s = rest.rsplit(":", 1)
+            cfg = self._spreads.get(sid)
+            if cfg:
+                try:
+                    delta = float(delta_s)
+                    if kind == "adj_in":
+                        cfg.in_threshold = max(0.0, round(cfg.in_threshold + delta, 3))
+                        await self.store.update_field(sid, "in_threshold", str(cfg.in_threshold))
+                    else:
+                        cfg.out_threshold = max(0.0, round(cfg.out_threshold + delta, 3))
+                        await self.store.update_field(sid, "out_threshold", str(cfg.out_threshold))
+                    await self._show_detail(q, cid, cfg)
+                except Exception:
+                    pass
         elif data.startswith("toggle:"):
             sid = data[7:]
             cfg = self._spreads.get(sid)
@@ -482,6 +527,30 @@ class SpreadBot:
             await self.store.set_monitor_spread(sid)
             await q.answer("📺 Terminal synced!", show_alert=False)
 
+    def _detail_kb(self, cfg: SpreadConfig) -> InlineKeyboardMarkup:
+        sid = cfg.spread_id
+        it = cfg.in_threshold
+        ot = cfg.out_threshold
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"📉 IN: {it:.2f}%",  callback_data=f"noop"),
+                InlineKeyboardButton("➖0.1", callback_data=f"adj_in:{sid}:-0.1"),
+                InlineKeyboardButton("➕0.1", callback_data=f"adj_in:{sid}:+0.1"),
+                InlineKeyboardButton("➕0.5", callback_data=f"adj_in:{sid}:+0.5"),
+            ],
+            [
+                InlineKeyboardButton(f"📈 OUT: {ot:.2f}%", callback_data=f"noop"),
+                InlineKeyboardButton("➖0.1", callback_data=f"adj_out:{sid}:-0.1"),
+                InlineKeyboardButton("➕0.1", callback_data=f"adj_out:{sid}:+0.1"),
+                InlineKeyboardButton("➕0.5", callback_data=f"adj_out:{sid}:+0.5"),
+            ],
+            [
+                InlineKeyboardButton("🔔 Toggle alerts", callback_data=f"toggle:{sid}"),
+                InlineKeyboardButton("📺 Terminal",       callback_data=f"terminal:{sid}"),
+            ],
+            [InlineKeyboardButton("🗑 Delete spread",    callback_data=f"del:{sid}")],
+        ])
+
     async def _show_detail(self, q, cid: int, cfg: SpreadConfig) -> None:
         ss = self.feed.spread_snapshot(cfg.leg_a, cfg.leg_b)
         in_s  = f"{ss.in_spread_pct:+.3f}%"  if ss.in_spread_pct  is not None else "N/A"
@@ -493,15 +562,9 @@ class SpreadBot:
             f"Thresholds: IN {cfg.in_threshold}% | OUT {cfg.out_threshold}%\n"
             f"Alerts: {alerts}"
         )
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔔 Toggle alerts", callback_data=f"toggle:{cfg.spread_id}"),
-                InlineKeyboardButton("📺 Terminal", callback_data=f"terminal:{cfg.spread_id}"),
-            ],
-            [InlineKeyboardButton("🗑 Delete spread", callback_data=f"del:{cfg.spread_id}")],
-        ])
         try:
-            await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
+                                       reply_markup=self._detail_kb(cfg))
         except Exception:
             pass
 

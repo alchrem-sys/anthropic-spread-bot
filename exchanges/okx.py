@@ -15,11 +15,28 @@ _OKX_REST = "https://www.okx.com/api/v5/market/books"
 _OKX_FUND = "https://www.okx.com/api/v5/public/funding-rate"
 
 
+def _okx_inst_id(symbol: str, futures: bool) -> str:
+    """Normalize user symbol → OKX instId.
+    'LABUSDT' → 'LAB-USDT-SWAP' (futures) or 'LAB-USDT' (spot).
+    Already-formatted symbols (contain '-') are returned as-is.
+    """
+    if "-" in symbol:
+        return symbol
+    for quote in ("USDT", "USDC", "BTC", "ETH", "USD"):
+        if symbol.endswith(quote):
+            base = symbol[:-len(quote)]
+            return f"{base}-{quote}-SWAP" if futures else f"{base}-{quote}"
+    return symbol
+
+
 class OKXFutures(Exchange):
     """OKX perpetual swap futures (instId ends with -SWAP)."""
 
     name = "okx"
     market_type = "futures"
+
+    def add_symbol(self, symbol: str) -> None:
+        super().add_symbol(_okx_inst_id(symbol, futures=True))
 
     async def start(self, session: aiohttp.ClientSession) -> None:
         if self._tasks:
@@ -112,6 +129,9 @@ class OKXSpot(Exchange):
 
     name = "okx"
     market_type = "spot"
+
+    def add_symbol(self, symbol: str) -> None:
+        super().add_symbol(_okx_inst_id(symbol, futures=False))
 
     def _ws_url(self) -> str:
         return _OKX_WS
