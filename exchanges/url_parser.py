@@ -179,10 +179,16 @@ def _bitget(host: str, path: str, _url: str) -> Optional[ExchangeInfo]:
 
 
 def _aster(host: str, path: str, _url: str) -> Optional[ExchangeInfo]:
-    # https://asterdex.com/futures/ANTHROPICUSDT  (pattern assumed from docs)
+    # https://asterdex.com/futures/ANTHROPICUSDT
+    # https://www.asterdex.com/ru/trade/pro/futures/UBUSDT  ← localized path
     if "aster" not in host:
         return None
-    m = re.search(r"/(?:futures|trade)/([A-Z0-9_]+)", path, re.I)
+    # Prioritise /futures/SYMBOL — must match before /trade/SYMBOL to avoid
+    # catching path segments like "pro" in /trade/pro/futures/UBUSDT
+    m = re.search(r"/futures/([A-Z0-9_]+)", path, re.I)
+    if not m:
+        # Fall back: /trade/SYMBOL only when SYMBOL is the last path segment
+        m = re.search(r"/trade/([A-Z0-9_]+)$", path, re.I)
     sym = m.group(1).upper() if m else None
     if not sym:
         return None

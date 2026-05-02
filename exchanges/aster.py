@@ -71,7 +71,9 @@ class AsterFutures(Exchange):
             params={"symbol": symbol, "limit": "20"},
             timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
-            body = await resp.json()
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}")
+            body = await resp.json(content_type=None)
         if not isinstance(body, dict):
             return {}
         bids = self._parse_levels_list(body.get("bids") or [])

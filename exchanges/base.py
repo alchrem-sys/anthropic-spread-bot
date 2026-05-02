@@ -17,6 +17,7 @@ RECONNECT_MIN_S = 1.0
 RECONNECT_MAX_S = 30.0
 REST_POLL_INTERVAL_S = 0.5
 BOOK_DEPTH = 20
+WS_IDLE_TIMEOUT_S = 30.0   # reconnect if WS connected but silent this long
 
 
 @dataclass
@@ -120,7 +121,17 @@ class Exchange:
                         for msg in self._subscribe_msgs(sym):
                             await ws.send(__import__("json").dumps(msg))
                     backoff = RECONNECT_MIN_S
-                    async for raw in ws:
+                    while not self._stop.is_set():
+                        try:
+                            raw = await asyncio.wait_for(
+                                ws.recv(), timeout=WS_IDLE_TIMEOUT_S
+                            )
+                        except asyncio.TimeoutError:
+                            self.log.warning(
+                                "ws idle [%s]: no data for %.0fs, reconnecting",
+                                self.name, WS_IDLE_TIMEOUT_S,
+                            )
+                            break
                         if self._stop.is_set():
                             break
                         try:
