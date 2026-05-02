@@ -273,6 +273,7 @@ class AlertChannelState:
     active: bool = False
     last_fired: float = 0.0
     triggered_at: float = 0.0   # monotonic time when threshold was first crossed
+    pinned_msg_id: Optional[int] = None  # message_id of the persistent header message
 
 
 @dataclass
@@ -896,23 +897,47 @@ class SpreadBot:
             if above:
                 # Start / keep the confirmation timer
                 if ch.triggered_at == 0.0:
-                    ch.triggered_at = now          # first tick above threshold
-                held = now - ch.triggered_at
-                if held < ALERT_CONFIRM_S:
+                    ch.triggered_at = now
+                if now - ch.triggered_at < ALERT_CONFIRM_S:
                     return                          # not held long enough yet
                 # Confirmed — fire if cooldown elapsed
                 if now - ch.last_fired < ALERT_INTERVAL_S:
                     return
                 ch.last_fired = now
-                await _send_alert(bot, cid, cfg, ss, kind)
+                is_first = ch.pinned_msg_id is None
+                main_text, follow_text = _build_alert_texts(cfg, ss, kind)
+                mute_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔕 Вимкнути алерти", callback_data=f"mute:{cfg.spread_id}"),
+                ]])
+                if is_first:
+                    # Send persistent header message
+                    sent = await _safe_send(bot, cid, main_text, reply_markup=mute_kb)
+                    if sent:
+                        ch.pinned_msg_id = sent.message_id
+                else:
+                    # Edit persistent header in place (update price/time)
+                    try:
+                        await bot.edit_message_text(
+                            main_text, chat_id=cid,
+                            message_id=ch.pinned_msg_id,
+                            reply_markup=mute_kb,
+                        )
+                    except Exception:
+                        # Message may have been deleted; resend
+                        sent = await _safe_send(bot, cid, main_text, reply_markup=mute_kb)
+                        if sent:
+                            ch.pinned_msg_id = sent.message_id
+                    # Send follow-up notification and delete it after 1s
+                    asyncio.create_task(_send_and_delete(bot, cid, follow_text))
                 if cfg.pushover_on:
                     pk = await self.store.get_pushover_key(cid)
                     if pk:
                         await self._send_pushover(pk, push_title, msg_text)
             else:
-                # Below threshold — reset confirmation timer and active flag
+                # Below threshold — reset everything
                 ch.triggered_at = 0.0
                 ch.active = False
+                ch.pinned_msg_id = None
 
         # IN
         if ss.in_spread_pct is not None:
@@ -985,14 +1010,11 @@ def _fmt_status(cfg: SpreadConfig, ss: SpreadSnapshot) -> str:
     )
 
 
-async def _send_alert(bot, cid, cfg: SpreadConfig, ss: SpreadSnapshot, ch: str) -> None:
+def _build_alert_texts(cfg: SpreadConfig, ss: SpreadSnapshot, ch: str) -> tuple[str, str]:
+    """Return (main_text, follow_text) for an alert. Does not send anything."""
     a, b = ss.leg_a, ss.leg_b
     af = f"{a.funding*100:.4f}%" if a.funding is not None else "N/A"
     bf = f"{b.funding*100:.4f}%" if b.funding is not None else "N/A"
-    sid = cfg.spread_id
-    mute_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔕 Вимкнути алерти", callback_data=f"mute:{sid}"),
-    ]])
     if ch == "IN":
         p = f"{ss.in_spread_pct:+.3f}%" if ss.in_spread_pct is not None else "N/A"
         u = f"${ss.in_spread_usd:+.4f}" if ss.in_spread_usd is not None else ""
@@ -1017,25 +1039,36 @@ async def _send_alert(bot, cid, cfg: SpreadConfig, ss: SpreadSnapshot, ch: str) 
             f"⏰ {_ts()}"
         )
         follow = f"↘️ STILL OPEN OUT {p}"
-    await _safe_send(bot, cid, main, reply_markup=mute_kb)
-    await asyncio.sleep(0.1)
-    await _safe_send(bot, cid, follow)
+    return main, follow
 
 
 async def _send_oi_alert(bot, cid, cfg: SpreadConfig, oi: float) -> None:
     await _safe_send(bot, cid, f"⚡ HIGH OI  ${oi/1e6:.2f}M\n{cfg.name}\n⏰ {_ts()}")
-    await asyncio.sleep(0.1)
-    await _safe_send(bot, cid, f"⚡ OI STILL ${oi/1e6:.2f}M")
 
 
-async def _safe_send(bot, cid, text, reply_markup=None) -> None:
+async def _send_and_delete(bot, cid: int, text: str) -> None:
+    """Send a notification message and delete it after 1 s (just to trigger vibration)."""
     try:
-        await bot.send_message(cid, text, reply_markup=reply_markup)
+        msg = await bot.send_message(cid, text)
+        await asyncio.sleep(1.0)
+        await bot.delete_message(cid, msg.message_id)
+    except Exception:
+        pass
+
+
+async def _safe_send(bot, cid, text, reply_markup=None):
+    """Send a message, handle RetryAfter. Returns the Message object or None."""
+    try:
+        return await bot.send_message(cid, text, reply_markup=reply_markup)
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after)
-        await bot.send_message(cid, text, reply_markup=reply_markup)
+        try:
+            return await bot.send_message(cid, text, reply_markup=reply_markup)
+        except Exception:
+            return None
     except TelegramError as e:
         log.warning("send error %s: %s", cid, e)
+        return None
 
 
 # ─────────────────────────────────────────── entry point
