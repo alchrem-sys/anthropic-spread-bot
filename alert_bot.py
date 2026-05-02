@@ -37,7 +37,7 @@ from telegram.ext import (
     ContextTypes, ConversationHandler, MessageHandler, filters,
 )
 
-from exchanges import ExchangeInfo, parse_url
+from exchanges import ExchangeInfo
 from feed_manager import FeedManager, SpreadSnapshot
 
 load_dotenv()
@@ -51,7 +51,62 @@ OUT_DEPTH_RANGE_PCT = 4.5
 ALERT_INTERVAL_S = 3.0
 DISPATCH_TICK_S = 1.0
 
-ASK_URL_A, ASK_URL_B = range(2)
+ASK_LEG_A_EX, ASK_LEG_A_SYM, ASK_LEG_B_EX, ASK_LEG_B_SYM = range(4)
+
+# ── exchange menu ──────────────────────────────────────────────────────────────
+_EXCHANGES = [
+    ("Gate Futures",     "gate",        "futures"),
+    ("Gate Spot",        "gate",        "spot"),
+    ("Binance Futures",  "binance",     "futures"),
+    ("Binance Spot",     "binance",     "spot"),
+    ("Bybit Futures",    "bybit",       "futures"),
+    ("Bybit Spot",       "bybit",       "spot"),
+    ("OKX Futures",      "okx",         "futures"),
+    ("OKX Spot",         "okx",         "spot"),
+    ("MEXC Futures",     "mexc",        "futures"),
+    ("MEXC Spot",        "mexc",        "spot"),
+    ("KuCoin Futures",   "kucoin",      "futures"),
+    ("KuCoin Spot",      "kucoin",      "spot"),
+    ("Bitget Futures",   "bitget",      "futures"),
+    ("Bitget Spot",      "bitget",      "spot"),
+    ("Aster Futures",    "aster",       "futures"),
+    ("Hyperliquid",      "hyperliquid", "futures"),
+]
+
+# ticker format hints shown to the user after exchange selection
+_SYM_HINT = {
+    ("gate",        "futures"): "напр. `ANTHROPIC_USDT`",
+    ("gate",        "spot"):    "напр. `ANTHROPIC_USDT`",
+    ("binance",     "futures"): "напр. `ANTHROPICUSDT`",
+    ("binance",     "spot"):    "напр. `ANTHROPICUSDT`",
+    ("bybit",       "futures"): "напр. `ANTHROPICUSDT`",
+    ("bybit",       "spot"):    "напр. `ANTHROPICUSDT`",
+    ("okx",         "futures"): "напр. `ANTHROPIC-USDT-SWAP`",
+    ("okx",         "spot"):    "напр. `ANTHROPIC-USDT`",
+    ("mexc",        "futures"): "напр. `ANTHROPIC_USDT`",
+    ("mexc",        "spot"):    "напр. `ANTHROPIC_USDT`",
+    ("kucoin",      "futures"): "напр. `XBTUSDTM` (з M на кінці)",
+    ("kucoin",      "spot"):    "напр. `ANTHROPIC-USDT`",
+    ("bitget",      "futures"): "напр. `ANTHROPICUSDT`",
+    ("bitget",      "spot"):    "напр. `ANTHROPICUSDT`",
+    ("aster",       "futures"): "напр. `UBUSDT`",
+    ("hyperliquid", "futures"): "напр. `ANTHROPIC`",
+}
+
+def _ex_keyboard(cb_prefix: str) -> InlineKeyboardMarkup:
+    """Two-column exchange selection keyboard."""
+    rows = []
+    for i in range(0, len(_EXCHANGES), 2):
+        row = []
+        for label, ex, mt in _EXCHANGES[i:i+2]:
+            row.append(InlineKeyboardButton(label, callback_data=f"{cb_prefix}:{ex}:{mt}"))
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+def _make_info(exchange: str, market_type: str, symbol: str) -> ExchangeInfo:
+    label = next((lbl for lbl, ex, mt in _EXCHANGES if ex == exchange and mt == market_type), exchange)
+    return ExchangeInfo(exchange=exchange, symbol=symbol,
+                        market_type=market_type, display=f"{label} · {symbol}")
 
 
 # ─────────────────────────────────────────── data models
@@ -187,7 +242,6 @@ class SpreadBot:
         self._runtimes:    dict[int, ChatRuntime]   = {}
         self._spreads:     dict[str, SpreadConfig]  = {}
         self._chat_spreads:dict[int, list[str]]     = {}
-        self._conv_a:      dict[int, ExchangeInfo]  = {}
 
     async def _post_init(self, app: Application) -> None:
         self._app = app
@@ -285,39 +339,60 @@ class SpreadBot:
 
     async def cmd_newspread(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
         await u.message.reply_text(
-            "📎 Send the trade URL for *Leg A* (the venue you'll SHORT to enter).",
+            "📊 *Новий спред — Leg A (SHORT)*\nВибери біржу:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_ex_keyboard("leg_a"),
+        )
+        return ASK_LEG_A_EX
+
+    async def conv_leg_a_ex(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        q = u.callback_query
+        await q.answer()
+        _, exchange, market_type = q.data.split(":", 2)
+        c.user_data["leg_a_ex"] = exchange
+        c.user_data["leg_a_mt"] = market_type
+        hint = _SYM_HINT.get((exchange, market_type), "введи тікер")
+        label = next((lbl for lbl, ex, mt in _EXCHANGES if ex == exchange and mt == market_type), exchange)
+        await q.edit_message_text(
+            f"✅ Leg A: *{label}*\n\nВведи тікер ({hint}):",
             parse_mode=ParseMode.MARKDOWN,
         )
-        return ASK_URL_A
+        return ASK_LEG_A_SYM
 
-    async def conv_url_a(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-        cid = u.effective_chat.id
-        info = parse_url(u.message.text.strip())
-        if info is None:
-            await u.message.reply_text(
-                "❌ Unrecognised URL. Paste a direct trade page, e.g.:\n"
-                "`https://www.gate.io/futures/USDT/ANTHROPIC_USDT`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return ASK_URL_A
-        self._conv_a[cid] = info
+    async def conv_leg_a_sym(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        sym = u.message.text.strip().upper()
+        c.user_data["leg_a_sym"] = sym
+        exchange = c.user_data["leg_a_ex"]
+        market_type = c.user_data["leg_a_mt"]
+        label = next((lbl for lbl, ex, mt in _EXCHANGES if ex == exchange and mt == market_type), exchange)
         await u.message.reply_text(
-            f"✅ Leg A: *{info.display}*\n\n"
-            "📎 Now send the URL for *Leg B* (the venue you'll LONG to enter).",
+            f"✅ Leg A: *{label} · {sym}*\n\n📊 *Leg B (LONG)* — вибери біржу:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_ex_keyboard("leg_b"),
+        )
+        return ASK_LEG_B_EX
+
+    async def conv_leg_b_ex(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        q = u.callback_query
+        await q.answer()
+        _, exchange, market_type = q.data.split(":", 2)
+        c.user_data["leg_b_ex"] = exchange
+        c.user_data["leg_b_mt"] = market_type
+        hint = _SYM_HINT.get((exchange, market_type), "введи тікер")
+        label = next((lbl for lbl, ex, mt in _EXCHANGES if ex == exchange and mt == market_type), exchange)
+        await q.edit_message_text(
+            f"✅ Leg B: *{label}*\n\nВведи тікер ({hint}):",
             parse_mode=ParseMode.MARKDOWN,
         )
-        return ASK_URL_B
+        return ASK_LEG_B_SYM
 
-    async def conv_url_b(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+    async def conv_leg_b_sym(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
         cid = u.effective_chat.id
-        info_b = parse_url(u.message.text.strip())
-        if info_b is None:
-            await u.message.reply_text("❌ Unrecognised URL. Try again.")
-            return ASK_URL_B
-        info_a = self._conv_a.pop(cid, None)
-        if info_a is None:
-            await u.message.reply_text("Session expired. Please /newspread again.")
-            return ConversationHandler.END
+        sym_b = u.message.text.strip().upper()
+        ud = c.user_data
+        info_a = _make_info(ud["leg_a_ex"], ud["leg_a_mt"], ud["leg_a_sym"])
+        info_b = _make_info(ud["leg_b_ex"], ud["leg_b_mt"], sym_b)
+        c.user_data.clear()
 
         sid = str(uuid.uuid4())[:8]
         cfg = SpreadConfig(spread_id=sid, leg_a=info_a, leg_b=info_b)
@@ -331,16 +406,16 @@ class SpreadBot:
         rt.selected_spread_id = sid
         await self.store.set_selected_spread(cid, sid)
         await u.message.reply_text(
-            f"✅ Spread added!\n*{cfg.name}*\n\n"
-            f"Thresholds: IN {cfg.in_threshold}% | OUT {cfg.out_threshold}%\n"
-            "Use /status for live prices.",
+            f"✅ Спред додано!\n*{cfg.name}*\n\n"
+            f"Пороги: IN {cfg.in_threshold}% | OUT {cfg.out_threshold}%\n"
+            "Дивись /status",
             parse_mode=ParseMode.MARKDOWN,
         )
         return ConversationHandler.END
 
     async def conv_cancel(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-        self._conv_a.pop(u.effective_chat.id, None)
-        await u.message.reply_text("Cancelled.")
+        c.user_data.clear()
+        await u.message.reply_text("Скасовано.")
         return ConversationHandler.END
 
     # ─── /spreads
@@ -370,7 +445,9 @@ class SpreadBot:
 
         if data == "newspread":
             await q.message.reply_text(
-                "📎 Send the trade URL for *Leg A*.", parse_mode=ParseMode.MARKDOWN
+                "📊 *Новий спред — Leg A (SHORT)*\nВибери біржу:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_ex_keyboard("leg_a"),
             )
         elif data.startswith("sel:"):
             sid = data[4:]
@@ -695,10 +772,13 @@ def main() -> None:
     conv = ConversationHandler(
         entry_points=[CommandHandler("newspread", bot_core.cmd_newspread)],
         states={
-            ASK_URL_A: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_url_a)],
-            ASK_URL_B: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_url_b)],
+            ASK_LEG_A_EX:  [CallbackQueryHandler(bot_core.conv_leg_a_ex,  pattern=r"^leg_a:")],
+            ASK_LEG_A_SYM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_leg_a_sym)],
+            ASK_LEG_B_EX:  [CallbackQueryHandler(bot_core.conv_leg_b_ex,  pattern=r"^leg_b:")],
+            ASK_LEG_B_SYM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_leg_b_sym)],
         },
         fallbacks=[CommandHandler("cancel", bot_core.conv_cancel)],
+        per_message=False,
     )
 
     app.add_handler(conv)
