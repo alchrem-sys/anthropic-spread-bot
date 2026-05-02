@@ -33,8 +33,8 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler,
-    ContextTypes, ConversationHandler, MessageHandler, filters,
+    Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
+    ContextTypes, ConversationHandler, MessageHandler, TypeHandler, filters,
 )
 
 from exchanges import ExchangeInfo
@@ -50,6 +50,35 @@ log = logging.getLogger("alert_bot")
 OUT_DEPTH_RANGE_PCT = 4.5
 ALERT_INTERVAL_S = 3.0
 DISPATCH_TICK_S = 1.0
+
+REQUIRED_CHANNEL = "@l1xosha"   # users must be subscribed to this channel
+
+
+async def _gate_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before every handler (group -1). Blocks non-subscribers."""
+    user = update.effective_user
+    if user is None:
+        raise ApplicationHandlerStop
+    try:
+        member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user.id)
+        if member.status in ("left", "kicked", "banned"):
+            raise PermissionError
+    except ApplicationHandlerStop:
+        raise
+    except PermissionError:
+        if update.message:
+            await update.message.reply_text(
+                f"🔒 Бот доступний лише для підписників каналу {REQUIRED_CHANNEL}\n\n"
+                f"Підпишись → {REQUIRED_CHANNEL} і спробуй ще раз."
+            )
+        elif update.callback_query:
+            await update.callback_query.answer(
+                f"🔒 Підпишись на {REQUIRED_CHANNEL} для доступу", show_alert=True
+            )
+        raise ApplicationHandlerStop
+    except Exception:
+        # Can't check (e.g. network error) — allow through to avoid false lockouts
+        pass
 
 ASK_LEG_A_EX, ASK_LEG_A_SYM, ASK_LEG_B_EX, ASK_LEG_B_SYM = range(4)
 
@@ -957,6 +986,9 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", bot_core.conv_cancel)],
         per_message=False,
     )
+
+    # Gate: runs before every handler — blocks non-subscribers
+    app.add_handler(TypeHandler(Update, _gate_check), group=-1)
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("start",          bot_core.cmd_start))
