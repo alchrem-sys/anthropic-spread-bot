@@ -189,15 +189,16 @@ class RedisConfigStore(ConfigStore):
 
 async def build_config_store() -> ConfigStore:
     url = os.getenv("REDIS_URL", "").strip()
-    if url:
-        store = await RedisConfigStore.try_create(url)
-        if store is not None:
-            log.info("config store: Redis (%s)", url.split("@")[-1])
-            return store
-        log.warning("Redis unavailable — falling back to JSON (settings will reset on Railway restarts)")
-    data_path = os.getenv("DATA_PATH", "config.json")
-    log.info("config store: JSON at %s", os.path.abspath(data_path))
-    return JsonConfigStore(data_path)
+    if not url:
+        raise SystemExit("REDIS_URL is not set. Add it to Railway env vars (Upstash free tier works).")
+    try:
+        from redis.asyncio import from_url
+        client = from_url(url, decode_responses=True)
+        await client.ping()
+    except Exception as e:
+        raise SystemExit(f"Cannot connect to Redis ({url.split('@')[-1]}): {e}") from e
+    log.info("config store: Redis at %s", url.split("@")[-1])
+    return RedisConfigStore(client)
 
 
 # ----------------------------------------------------------------- shared state
