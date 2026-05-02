@@ -43,9 +43,9 @@ class PriceFeed:
         self.dex_hl = dex_hl
         self._lock = asyncio.Lock()
         self._prices: dict[str, dict[str, Any]] = {
-            "gate": {"bid": None, "ask": None, "funding": None, "ts": None},
-            "hl": {"bid": None, "ask": None, "funding": None, "oi": None, "mark_px": None,
-                   "bids": [], "ts": None},
+            "gate": {"bid": None, "ask": None, "funding": None, "asks": [], "ts": None},
+            "hl":   {"bid": None, "ask": None, "funding": None, "oi": None, "mark_px": None,
+                     "bids": [], "ts": None},
         }
         self._tasks: list[asyncio.Task] = []
         self._session: Optional[aiohttp.ClientSession] = None
@@ -107,6 +107,7 @@ class PriceFeed:
         mark = hl.get("mark_px")
         snap["hl_oi_usd"] = float(oi) * float(mark) if oi is not None and mark is not None else None
         snap["hl_bids"] = list(hl.get("bids") or [])
+        snap["gate_asks"] = list(gate.get("asks") or [])
         return snap
 
     async def _set(
@@ -119,6 +120,7 @@ class PriceFeed:
         oi: Optional[float] = None,
         mark_px: Optional[float] = None,
         bids: Optional[list] = None,
+        asks: Optional[list] = None,
         touch_ts: bool = True,
     ) -> None:
         async with self._lock:
@@ -135,6 +137,8 @@ class PriceFeed:
                 p["mark_px"] = mark_px
             if bids is not None:
                 p["bids"] = bids
+            if asks is not None:
+                p["asks"] = asks
             if touch_ts and (bid is not None or ask is not None):
                 p["ts"] = time.monotonic()
 
@@ -152,7 +156,7 @@ class PriceFeed:
                         "time": int(time.time()),
                         "channel": "futures.order_book",
                         "event": "subscribe",
-                        "payload": [self.symbol_gate, "100ms", "1"],
+                        "payload": [self.symbol_gate, "100ms", "20"],
                     }
                     sub_tk = {
                         "time": int(time.time()),
@@ -187,12 +191,13 @@ class PriceFeed:
         if event in ("subscribe", "unsubscribe", None):
             return
         if channel == "futures.order_book" and isinstance(result, dict):
-            asks = result.get("asks") or []
-            bids = result.get("bids") or []
-            bid = float(bids[0]["p"]) if bids else None
-            ask = float(asks[0]["p"]) if asks else None
+            raw_asks = result.get("asks") or []
+            raw_bids = result.get("bids") or []
+            bid = float(raw_bids[0]["p"]) if raw_bids else None
+            ask = float(raw_asks[0]["p"]) if raw_asks else None
+            parsed_asks = [{"px": float(a["p"]), "sz": float(a["s"])} for a in raw_asks]
             if bid is not None or ask is not None:
-                await self._set("gate", bid=bid, ask=ask)
+                await self._set("gate", bid=bid, ask=ask, asks=parsed_asks)
         elif channel == "futures.tickers":
             entries = result if isinstance(result, list) else [result]
             for t in entries:
@@ -325,7 +330,7 @@ class PriceFeed:
 
     async def _poll_gate_rest(self) -> None:
         assert self._session is not None
-        params = {"contract": self.symbol_gate, "limit": "1"}
+        params = {"contract": self.symbol_gate, "limit": "20"}
         async with self._session.get(
             GATE_REST_ORDER_BOOK,
             params=params,
@@ -334,13 +339,13 @@ class PriceFeed:
             body = await resp.json()
         if not isinstance(body, dict):
             return
-        asks = body.get("asks") or []
-        bids = body.get("bids") or []
-        # Gate REST returns {"p": "...", "s": ...}
-        bid = float(bids[0]["p"]) if bids else None
-        ask = float(asks[0]["p"]) if asks else None
+        raw_asks = body.get("asks") or []
+        raw_bids = body.get("bids") or []
+        bid = float(raw_bids[0]["p"]) if raw_bids else None
+        ask = float(raw_asks[0]["p"]) if raw_asks else None
+        parsed_asks = [{"px": float(a["p"]), "sz": float(a["s"])} for a in raw_asks]
         if bid is not None or ask is not None:
-            await self._set("gate", bid=bid, ask=ask)
+            await self._set("gate", bid=bid, ask=ask, asks=parsed_asks)
 
     async def _poll_hl_rest(self) -> None:
         assert self._session is not None
@@ -373,6 +378,15 @@ class PriceFeed:
         best = bids[0]["px"]
         cutoff = best * (1.0 - range_pct / 100.0)
         return sum(b["sz"] for b in bids if b["px"] >= cutoff)
+
+    @staticmethod
+    def ask_depth_within_pct(asks: list[dict], range_pct: float) -> float:
+        """Sum of ask sizes where price <= best_ask * (1 + range_pct/100)."""
+        if not asks:
+            return 0.0
+        best = asks[0]["px"]
+        cutoff = best * (1.0 + range_pct / 100.0)
+        return sum(a["sz"] for a in asks if a["px"] <= cutoff)
 
     # ----------------------------------------------------------------- smoke test
 

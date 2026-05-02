@@ -285,14 +285,14 @@ def fmt_in_alert(snap: dict) -> str:
     )
 
 
-def fmt_out_alert(snap: dict, depth: float) -> str:
+def fmt_out_alert(snap: dict, hl_depth: float, gate_depth: float) -> str:
     g = snap["gate"]
     h = snap["hl"]
     return (
         "🔴 ARB EXIT SIGNAL — ANTHROPIC\n"
         f"📉 OUT Spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})\n"
         f"HL bid: {_fmt_price(h['bid'])} | Gate ask: {_fmt_price(g['ask'])}\n"
-        f"HL bid depth (-{OUT_DEPTH_RANGE_PCT}%): {depth:.3f} coins\n"
+        f"Depth (-{OUT_DEPTH_RANGE_PCT}%): HL bids {hl_depth:.3f} | Gate asks {gate_depth:.3f} coins\n"
         f"Fund diff: Gate {_fmt_funding(g['funding'])} / HL {_fmt_funding(h['funding'])}\n"
         f"⏰ {_now_utc_str()}"
     )
@@ -304,14 +304,14 @@ def _fmt_oi(v: Optional[float]) -> str:
     return f"${v / 1_000_000:.3f}M"
 
 
-def fmt_out_max_alert(snap: dict, depth: float) -> str:
+def fmt_out_max_alert(snap: dict, hl_depth: float, gate_depth: float) -> str:
     g = snap["gate"]
     h = snap["hl"]
     return (
         "🔴🔴 OUT SPREAD EXTREME — ANTHROPIC\n"
         f"📉 OUT Spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})\n"
         f"HL bid: {_fmt_price(h['bid'])} | Gate ask: {_fmt_price(g['ask'])}\n"
-        f"HL bid depth (-{OUT_DEPTH_RANGE_PCT}%): {depth:.3f} coins\n"
+        f"Depth (-{OUT_DEPTH_RANGE_PCT}%): HL bids {hl_depth:.3f} | Gate asks {gate_depth:.3f} coins\n"
         f"Fund diff: Gate {_fmt_funding(g['funding'])} / HL {_fmt_funding(h['funding'])}\n"
         f"⏰ {_now_utc_str()}"
     )
@@ -338,8 +338,9 @@ def fmt_status(snap: dict, cfg: ChatConfig) -> str:
         f"HyperLiq bid={_fmt_price(h['bid'])} ask={_fmt_price(h['ask'])} "
         f"fund={_fmt_funding(h['funding'])} OI={_fmt_oi(snap.get('hl_oi_usd'))} "
         f"{'STALE' if snap['hl_stale'] else 'LIVE'}\n"
-        f"HL bid depth (-{OUT_DEPTH_RANGE_PCT}%): "
-        f"{PriceFeed.bid_depth_within_pct(snap.get('hl_bids', []), OUT_DEPTH_RANGE_PCT):.3f} coins "
+        f"Depth (-{OUT_DEPTH_RANGE_PCT}%): "
+        f"HL bids {PriceFeed.bid_depth_within_pct(snap.get('hl_bids', []), OUT_DEPTH_RANGE_PCT):.3f} | "
+        f"Gate asks {PriceFeed.ask_depth_within_pct(snap.get('gate_asks', []), OUT_DEPTH_RANGE_PCT):.3f} coins "
         f"(min {cfg.out_min_depth})\n"
         f"\nIN  spread: {_fmt_pct(snap['in_spread_pct'])} ({_fmt_usd(snap['in_spread_usd'])})  "
         f"thr={cfg.in_threshold:.3f}%\n"
@@ -590,18 +591,19 @@ async def alert_dispatcher(app: Application, feed: PriceFeed, state: BotState) -
             else:
                 rt.in_state.breached = False
 
-            # depth check — shared by both OUT alerts
-            depth = PriceFeed.bid_depth_within_pct(snap.get("hl_bids", []), OUT_DEPTH_RANGE_PCT)
-            depth_ok = depth >= rt.cfg.out_min_depth
+            # depth check — both HL bid side and Gate ask side must meet minimum
+            hl_depth = PriceFeed.bid_depth_within_pct(snap.get("hl_bids", []), OUT_DEPTH_RANGE_PCT)
+            gate_depth = PriceFeed.ask_depth_within_pct(snap.get("gate_asks", []), OUT_DEPTH_RANGE_PCT)
+            depth_ok = hl_depth >= rt.cfg.out_min_depth and gate_depth >= rt.cfg.out_min_depth
 
-            # OUT spread (lower threshold) — only fires when depth condition met
+            # OUT spread (lower threshold) — only fires when both depth conditions met
             if out_pct is not None and out_pct >= rt.cfg.out_threshold and depth_ok:
                 rt.out_state.breached = True
                 if now - rt.out_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
                     rt.out_state.last_fired = now
-                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_alert(snap, depth))
+                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_alert(snap, hl_depth, gate_depth))
                     await _safe_send(bot, rt.cfg.chat_id,
-                        f"🚨 STILL ACTIVE — OUT {_fmt_pct(out_pct)} ≥ thr {rt.cfg.out_threshold:.3f}% | depth {depth:.3f}")
+                        f"🚨 STILL ACTIVE — OUT {_fmt_pct(out_pct)} ≥ thr {rt.cfg.out_threshold:.3f}% | HL {hl_depth:.2f} / Gate {gate_depth:.2f}")
             else:
                 rt.out_state.breached = False
 
@@ -610,9 +612,9 @@ async def alert_dispatcher(app: Application, feed: PriceFeed, state: BotState) -
                 rt.out_max_state.breached = True
                 if now - rt.out_max_state.last_fired >= ALERT_REFIRE_INTERVAL_S:
                     rt.out_max_state.last_fired = now
-                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_max_alert(snap, depth))
+                    await _safe_send(bot, rt.cfg.chat_id, fmt_out_max_alert(snap, hl_depth, gate_depth))
                     await _safe_send(bot, rt.cfg.chat_id,
-                        f"🚨🚨 EXTREME OUT — {_fmt_pct(out_pct)} ≥ max {rt.cfg.out_max_threshold:.3f}% | depth {depth:.3f}")
+                        f"🚨🚨 EXTREME OUT — {_fmt_pct(out_pct)} ≥ max {rt.cfg.out_max_threshold:.3f}% | HL {hl_depth:.2f} / Gate {gate_depth:.2f}")
             else:
                 rt.out_max_state.breached = False
 
