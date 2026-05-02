@@ -656,6 +656,30 @@ class SpreadBot:
                     await self._show_detail(q, cid, cfg)
                 except Exception:
                     pass
+        elif data.startswith("mute:"):
+            sid = data[5:]
+            cfg = self._spreads.get(sid)
+            if cfg:
+                cfg.alerts_on = False
+                await self.store.update_field(sid, "alerts_on", "0")
+                await q.answer("🔕 Алерти вимкнено", show_alert=False)
+                try:
+                    await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔔 Увімкнути алерти", callback_data=f"unmute:{sid}"),
+                    ]]))
+                except Exception:
+                    pass
+        elif data.startswith("unmute:"):
+            sid = data[7:]
+            cfg = self._spreads.get(sid)
+            if cfg:
+                cfg.alerts_on = True
+                await self.store.update_field(sid, "alerts_on", "1")
+                await q.answer("🔔 Алерти увімкнено", show_alert=False)
+                try:
+                    await q.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
         elif data.startswith("toggle:"):
             sid = data[7:]
             cfg = self._spreads.get(sid)
@@ -961,6 +985,10 @@ async def _send_alert(bot, cid, cfg: SpreadConfig, ss: SpreadSnapshot, ch: str) 
     a, b = ss.leg_a, ss.leg_b
     af = f"{a.funding*100:.4f}%" if a.funding is not None else "N/A"
     bf = f"{b.funding*100:.4f}%" if b.funding is not None else "N/A"
+    sid = cfg.spread_id
+    mute_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔕 Вимкнути алерти", callback_data=f"mute:{sid}"),
+    ]])
     if ch == "IN":
         p = f"{ss.in_spread_pct:+.3f}%" if ss.in_spread_pct is not None else "N/A"
         u = f"${ss.in_spread_usd:+.4f}" if ss.in_spread_usd is not None else ""
@@ -985,7 +1013,7 @@ async def _send_alert(bot, cid, cfg: SpreadConfig, ss: SpreadSnapshot, ch: str) 
             f"⏰ {_ts()}"
         )
         follow = f"↘️ STILL OPEN OUT {p}"
-    await _safe_send(bot, cid, main)
+    await _safe_send(bot, cid, main, reply_markup=mute_kb)
     await asyncio.sleep(0.1)
     await _safe_send(bot, cid, follow)
 
@@ -996,12 +1024,12 @@ async def _send_oi_alert(bot, cid, cfg: SpreadConfig, oi: float) -> None:
     await _safe_send(bot, cid, f"⚡ OI STILL ${oi/1e6:.2f}M")
 
 
-async def _safe_send(bot, cid, text) -> None:
+async def _safe_send(bot, cid, text, reply_markup=None) -> None:
     try:
-        await bot.send_message(cid, text)
+        await bot.send_message(cid, text, reply_markup=reply_markup)
     except RetryAfter as e:
         await asyncio.sleep(e.retry_after)
-        await bot.send_message(cid, text)
+        await bot.send_message(cid, text, reply_markup=reply_markup)
     except TelegramError as e:
         log.warning("send error %s: %s", cid, e)
 
