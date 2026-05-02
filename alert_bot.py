@@ -265,10 +265,14 @@ class SpreadConfig:
         )
 
 
+ALERT_CONFIRM_S = 2.0   # spread must hold above threshold this long before first alert
+
+
 @dataclass
 class AlertChannelState:
     active: bool = False
     last_fired: float = 0.0
+    triggered_at: float = 0.0   # monotonic time when threshold was first crossed
 
 
 @dataclass
@@ -887,27 +891,37 @@ class SpreadBot:
     async def _check(self, bot, cid, cfg, ss: SpreadSnapshot, rt, now) -> None:
         sid = cfg.spread_id
 
-        async def _fire(kind: str, ch: AlertChannelState, msg_text: str, push_title: str) -> None:
-            if now - ch.last_fired < ALERT_INTERVAL_S:
-                return
-            ch.last_fired = now
-            await _send_alert(bot, cid, cfg, ss, kind)
-            # Pushover
-            if cfg.pushover_on:
-                pk = await self.store.get_pushover_key(cid)
-                if pk:
-                    await self._send_pushover(pk, push_title, msg_text)
+        async def _fire(kind: str, ch: AlertChannelState, msg_text: str, push_title: str,
+                        above: bool) -> None:
+            if above:
+                # Start / keep the confirmation timer
+                if ch.triggered_at == 0.0:
+                    ch.triggered_at = now          # first tick above threshold
+                held = now - ch.triggered_at
+                if held < ALERT_CONFIRM_S:
+                    return                          # not held long enough yet
+                # Confirmed — fire if cooldown elapsed
+                if now - ch.last_fired < ALERT_INTERVAL_S:
+                    return
+                ch.last_fired = now
+                await _send_alert(bot, cid, cfg, ss, kind)
+                if cfg.pushover_on:
+                    pk = await self.store.get_pushover_key(cid)
+                    if pk:
+                        await self._send_pushover(pk, push_title, msg_text)
+            else:
+                # Below threshold — reset confirmation timer and active flag
+                ch.triggered_at = 0.0
+                ch.active = False
 
         # IN
         if ss.in_spread_pct is not None:
             ch = rt.channel(sid, "in")
-            if ss.in_spread_pct >= cfg.in_threshold:
-                pct_s = f"{ss.in_spread_pct:+.3f}%"
-                await _fire("IN", ch,
-                    f"IN Spread: {pct_s}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
-                    f"🟢 ARB ENTRY {pct_s}")
-            else:
-                ch.active = False
+            above = ss.in_spread_pct >= cfg.in_threshold
+            pct_s = f"{ss.in_spread_pct:+.3f}%"
+            await _fire("IN", ch,
+                f"IN Spread: {pct_s}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
+                f"🟢 ARB ENTRY {pct_s}", above)
 
         # OUT
         if ss.out_spread_pct is not None:
@@ -917,36 +931,30 @@ class SpreadBot:
                 da = ss.out_depth_a(OUT_DEPTH_RANGE_PCT)
                 db = ss.out_depth_b(OUT_DEPTH_RANGE_PCT)
                 depth_ok = da >= cfg.out_min_depth and db >= cfg.out_min_depth
-            if ss.out_spread_pct >= cfg.out_threshold and depth_ok:
-                pct_s = f"{ss.out_spread_pct:+.3f}%"
-                await _fire("OUT", ch,
-                    f"OUT Spread: {pct_s}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
-                    f"🔴 ARB EXIT {pct_s}")
-            else:
-                ch.active = False
+            above = ss.out_spread_pct >= cfg.out_threshold and depth_ok
+            pct_s = f"{ss.out_spread_pct:+.3f}%"
+            await _fire("OUT", ch,
+                f"OUT Spread: {pct_s}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
+                f"🔴 ARB EXIT {pct_s}", above)
 
         # OUT-MAX
         if ss.out_spread_pct is not None:
             ch = rt.channel(sid, "out_max")
-            if ss.out_spread_pct >= cfg.out_max_threshold:
-                pct_s = f"{ss.out_spread_pct:+.3f}%"
-                await _fire("OUT_MAX", ch,
-                    f"OUT MAX: {pct_s}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
-                    f"🔥 OUT MAX {pct_s}")
-            else:
-                ch.active = False
+            above = ss.out_spread_pct >= cfg.out_max_threshold
+            pct_s = f"{ss.out_spread_pct:+.3f}%"
+            await _fire("OUT_MAX", ch,
+                f"OUT MAX: {pct_s}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
+                f"🔥 OUT MAX {pct_s}", above)
 
         # OI
         oi_vals = [v for v in (ss.leg_a.oi_usd, ss.leg_b.oi_usd) if v is not None]
         if oi_vals:
             ch = rt.channel(sid, "oi")
             max_oi = max(oi_vals)
-            if max_oi >= cfg.oi_threshold:
-                await _fire("OI", ch,
-                    f"OI: ${max_oi:,.0f}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
-                    f"📊 OI Alert ${max_oi/1e6:.1f}M")
-            else:
-                ch.active = False
+            above = max_oi >= cfg.oi_threshold
+            await _fire("OI", ch,
+                f"OI: ${max_oi:,.0f}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
+                f"📊 OI Alert ${max_oi/1e6:.1f}M", above)
 
 
 # ─────────────────────────────────────────── formatters
