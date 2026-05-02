@@ -54,8 +54,9 @@ class BinanceFutures(Exchange):
         stream: str = msg.get("stream", "")
         data = msg.get("data") or {}
         if "depth" in stream:
-            bids = self._parse_levels_list(data.get("bids") or [])
-            asks = self._parse_levels_list(data.get("asks") or [])
+            # combined stream depth uses "b"/"a" keys (depthUpdate event)
+            bids = self._parse_levels_list(data.get("b") or data.get("bids") or [])
+            asks = self._parse_levels_list(data.get("a") or data.get("asks") or [])
             self._set_book(state, bids, asks)
         elif "markPrice" in stream:
             fr = data.get("r")
@@ -125,8 +126,8 @@ class BinanceSpot(Exchange):
 
     def _parse(self, msg: dict, state: dict) -> None:
         data = msg.get("data") or {}
-        bids = self._parse_levels_list(data.get("bids") or [])
-        asks = self._parse_levels_list(data.get("asks") or [])
+        bids = self._parse_levels_list(data.get("b") or data.get("bids") or [])
+        asks = self._parse_levels_list(data.get("a") or data.get("asks") or [])
         self._set_book(state, bids, asks)
 
     async def _rest_snapshot(self, symbol: str, session: aiohttp.ClientSession) -> dict:

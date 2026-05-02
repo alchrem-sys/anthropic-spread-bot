@@ -54,8 +54,9 @@ class AsterFutures(Exchange):
         stream: str = msg.get("stream", "")
         data = msg.get("data") or {}
         if "depth" in stream:
-            bids = self._parse_levels_list(data.get("bids") or [])
-            asks = self._parse_levels_list(data.get("asks") or [])
+            # combined stream depth uses "b"/"a" keys, REST snapshot uses "bids"/"asks"
+            bids = self._parse_levels_list(data.get("b") or data.get("bids") or [])
+            asks = self._parse_levels_list(data.get("a") or data.get("asks") or [])
             self._set_book(state, bids, asks)
         elif "markPrice" in stream:
             fr = data.get("r")
