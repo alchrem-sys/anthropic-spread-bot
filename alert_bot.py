@@ -52,6 +52,9 @@ ALERT_INTERVAL_S = 3.0
 DISPATCH_TICK_S = 1.0
 
 REQUIRED_CHANNEL = "@l1xosha"   # users must be subscribed to this channel
+# Comma-separated Telegram user IDs that bypass the subscription gate
+_admin_ids_raw = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS: set[int] = {int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip().isdigit()}
 
 
 async def _is_subscribed(bot, user_id: int) -> bool:
@@ -79,6 +82,10 @@ async def _gate_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if user is None:
         raise ApplicationHandlerStop
 
+    # Admins always bypass the gate
+    if user.id in ADMIN_IDS:
+        return
+
     # Let the "check_sub" callback through so we can handle it ourselves
     cq = update.callback_query
     if cq and cq.data == "check_sub":
@@ -88,8 +95,10 @@ async def _gate_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if update.message:
             await update.message.reply_text(
                 f"🔒 Бот доступний лише для підписників каналу {REQUIRED_CHANNEL}\n\n"
-                f"Підпишись на канал і натисни «✅ Перевірити підписку».",
+                f"Підпишись на канал і натисни «✅ Перевірити підписку».\n\n"
+                f"<i>Твій ID: <code>{user.id}</code></i>",
                 reply_markup=_GATE_KB,
+                parse_mode="HTML",
             )
         elif cq:
             await cq.answer(f"🔒 Підпишись на {REQUIRED_CHANNEL}", show_alert=True)
