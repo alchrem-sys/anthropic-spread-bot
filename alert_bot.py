@@ -679,17 +679,23 @@ class SpreadBot:
         al = "🔔 ON" if cfg.alerts_on else "🔕 OFF"
         pu = "📳 Push ON" if cfg.pushover_on else "📴 Push OFF"
         return InlineKeyboardMarkup([
-            # IN threshold row: label (centre) + minus/plus
+            # IN label row
+            [InlineKeyboardButton(f"📉 IN threshold: {it:.2f}%", callback_data="noop")],
+            # IN adjust row
             [
-                InlineKeyboardButton(f"−0.1", callback_data=f"adj_in:{sid}:-0.1"),
-                InlineKeyboardButton(f"📉 IN {it:.2f}%", callback_data="noop"),
-                InlineKeyboardButton(f"+0.1", callback_data=f"adj_in:{sid}:+0.1"),
+                InlineKeyboardButton("−0.5", callback_data=f"adj_in:{sid}:-0.5"),
+                InlineKeyboardButton("−0.1", callback_data=f"adj_in:{sid}:-0.1"),
+                InlineKeyboardButton("+0.1", callback_data=f"adj_in:{sid}:+0.1"),
+                InlineKeyboardButton("+0.5", callback_data=f"adj_in:{sid}:+0.5"),
             ],
-            # OUT threshold row
+            # OUT label row
+            [InlineKeyboardButton(f"📈 OUT threshold: {ot:.2f}%", callback_data="noop")],
+            # OUT adjust row
             [
-                InlineKeyboardButton(f"−0.1", callback_data=f"adj_out:{sid}:-0.1"),
-                InlineKeyboardButton(f"📈 OUT {ot:.2f}%", callback_data="noop"),
-                InlineKeyboardButton(f"+0.1", callback_data=f"adj_out:{sid}:+0.1"),
+                InlineKeyboardButton("−0.5", callback_data=f"adj_out:{sid}:-0.5"),
+                InlineKeyboardButton("−0.1", callback_data=f"adj_out:{sid}:-0.1"),
+                InlineKeyboardButton("+0.1", callback_data=f"adj_out:{sid}:+0.1"),
+                InlineKeyboardButton("+0.5", callback_data=f"adj_out:{sid}:+0.5"),
             ],
             # Alerts + Pushover toggle
             [
