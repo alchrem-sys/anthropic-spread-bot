@@ -147,6 +147,7 @@ class SpreadConfig:
     oi_threshold: float = 6_900_000.0
     out_min_depth: float = 0.5
     alerts_on: bool = True
+    pushover_on: bool = False   # per-spread Pushover toggle
 
     @property
     def name(self) -> str:
@@ -162,12 +163,13 @@ class SpreadConfig:
             "leg_b_sym":  self.leg_b.symbol,
             "leg_b_mt":   self.leg_b.market_type,
             "leg_b_disp": self.leg_b.display,
-            "in_threshold":     str(self.in_threshold),
-            "out_threshold":    str(self.out_threshold),
-            "out_max_threshold":str(self.out_max_threshold),
-            "oi_threshold":     str(self.oi_threshold),
-            "out_min_depth":    str(self.out_min_depth),
-            "alerts_on":        "1" if self.alerts_on else "0",
+            "in_threshold":      str(self.in_threshold),
+            "out_threshold":     str(self.out_threshold),
+            "out_max_threshold": str(self.out_max_threshold),
+            "oi_threshold":      str(self.oi_threshold),
+            "out_min_depth":     str(self.out_min_depth),
+            "alerts_on":         "1" if self.alerts_on else "0",
+            "pushover_on":       "1" if self.pushover_on else "0",
         }
 
     @classmethod
@@ -188,6 +190,7 @@ class SpreadConfig:
             oi_threshold=float(h.get("oi_threshold", 6_900_000.0)),
             out_min_depth=float(h.get("out_min_depth", 0.5)),
             alerts_on=h.get("alerts_on", "1") == "1",
+            pushover_on=h.get("pushover_on", "0") == "1",
         )
 
 
@@ -255,6 +258,12 @@ class RedisStore:
         await self._r.set("monitor:active_spread", sid)
         # bump a counter so the watcher detects the change even for the same spread
         await self._r.incr("monitor:active_spread_ts")
+
+    async def get_pushover_key(self, chat_id: int) -> Optional[str]:
+        return await self._r.get(f"chat:{chat_id}:pushover_key")
+
+    async def set_pushover_key(self, chat_id: int, key: str) -> None:
+        await self._r.set(f"chat:{chat_id}:pushover_key", key)
 
 
 # ─────────────────────────────────────────── bot
@@ -353,14 +362,75 @@ class SpreadBot:
 
     async def cmd_help(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         await u.message.reply_text(
-            "/newspread — add spread (2 trade URLs)\n"
-            "/spreads — list & select spreads\n"
-            "/status — live prices\n"
-            "/set_in /set_out /set_outmax /set_oi /set_out_depth — thresholds\n"
-            "/thresholds — show settings\n"
+            "/newspread — додати спред\n"
+            "/spreads — список спредів\n"
+            "/status — поточні ціни\n"
+            "/set_in /set_out — пороги\n"
             "/alerts_on | /alerts_off — toggle\n"
-            "/cancel — cancel current action"
+            "/set_pushover <key> — Pushover User Key\n"
+            "/test_push — тест пуш\n"
+            "/debug — статус з'єднань\n"
+            "/cancel — скасувати"
         )
+
+    # ─── Pushover
+
+    async def _send_pushover(self, user_key: str, title: str, message: str,
+                              priority: int = 1) -> None:
+        """Send a Pushover notification. priority=1 bypasses quiet hours."""
+        app_token = os.getenv("PUSHOVER_APP_TOKEN", "").strip()
+        if not app_token:
+            return
+        data = {
+            "token":    app_token,
+            "user":     user_key,
+            "title":    title,
+            "message":  message,
+            "sound":    "siren",
+            "priority": str(priority),
+        }
+        try:
+            assert self._session is not None
+            async with self._session.post(
+                "https://api.pushover.net/1/messages.json",
+                data=data,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                body = await resp.json(content_type=None)
+                if body.get("status") != 1:
+                    log.warning("pushover error: %s", body)
+        except Exception as e:
+            log.debug("pushover send failed: %s", e)
+
+    async def cmd_set_pushover(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        cid = u.effective_chat.id
+        if not c.args:
+            key = await self.store.get_pushover_key(cid)
+            status = f"Встановлено ({'*****' + key[-4:] if key else 'немає'})"
+            await u.message.reply_text(
+                f"Pushover: {status}\n\nВикористання: /set_pushover YOUR_USER_KEY\n"
+                "Ключ знайдеш на pushover.net (головна сторінка, 30 символів)."
+            )
+            return
+        key = c.args[0].strip()
+        if len(key) < 20:
+            await u.message.reply_text("❌ Ключ занадто короткий.")
+            return
+        await self.store.set_pushover_key(cid, key)
+        await u.message.reply_text("✅ Pushover ключ збережено! Тест: /test_push")
+
+    async def cmd_test_push(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+        cid = u.effective_chat.id
+        key = await self.store.get_pushover_key(cid)
+        if not key:
+            await u.message.reply_text("Спочатку /set_pushover YOUR_KEY")
+            return
+        await u.message.reply_text("Надсилаю тестовий пуш...")
+        await self._send_pushover(key,
+            "🧪 Тест Spread Bot",
+            "Пуш-нотифікації працюють! Звук: сирена 🚨"
+        )
+        await u.message.reply_text("✅ Відправлено! Перевіряй телефон.")
 
     # ─── /newspread conversation
 
@@ -522,6 +592,19 @@ class SpreadBot:
                 cfg.alerts_on = not cfg.alerts_on
                 await self.store.update_field(sid, "alerts_on", "1" if cfg.alerts_on else "0")
                 await self._show_detail(q, cid, cfg)
+        elif data.startswith("push_toggle:"):
+            sid = data[12:]
+            cfg = self._spreads.get(sid)
+            if cfg:
+                # Check if pushover key is configured for this chat
+                pk = await self.store.get_pushover_key(cid)
+                if not pk:
+                    await q.answer("⚠️ Спочатку встанови Pushover ключ: /set_pushover YOUR_KEY",
+                                   show_alert=True)
+                    return
+                cfg.pushover_on = not cfg.pushover_on
+                await self.store.update_field(sid, "pushover_on", "1" if cfg.pushover_on else "0")
+                await self._show_detail(q, cid, cfg)
         elif data.startswith("terminal:"):
             sid = data[9:]
             await self.store.set_monitor_spread(sid)
@@ -531,24 +614,31 @@ class SpreadBot:
         sid = cfg.spread_id
         it = cfg.in_threshold
         ot = cfg.out_threshold
+        al = "🔔 ON" if cfg.alerts_on else "🔕 OFF"
+        pu = "📳 Push ON" if cfg.pushover_on else "📴 Push OFF"
         return InlineKeyboardMarkup([
+            # IN threshold row: label (centre) + minus/plus
             [
-                InlineKeyboardButton(f"📉 IN: {it:.2f}%",  callback_data=f"noop"),
-                InlineKeyboardButton("➖0.1", callback_data=f"adj_in:{sid}:-0.1"),
-                InlineKeyboardButton("➕0.1", callback_data=f"adj_in:{sid}:+0.1"),
-                InlineKeyboardButton("➕0.5", callback_data=f"adj_in:{sid}:+0.5"),
+                InlineKeyboardButton(f"−0.1", callback_data=f"adj_in:{sid}:-0.1"),
+                InlineKeyboardButton(f"📉 IN {it:.2f}%", callback_data="noop"),
+                InlineKeyboardButton(f"+0.1", callback_data=f"adj_in:{sid}:+0.1"),
             ],
+            # OUT threshold row
             [
-                InlineKeyboardButton(f"📈 OUT: {ot:.2f}%", callback_data=f"noop"),
-                InlineKeyboardButton("➖0.1", callback_data=f"adj_out:{sid}:-0.1"),
-                InlineKeyboardButton("➕0.1", callback_data=f"adj_out:{sid}:+0.1"),
-                InlineKeyboardButton("➕0.5", callback_data=f"adj_out:{sid}:+0.5"),
+                InlineKeyboardButton(f"−0.1", callback_data=f"adj_out:{sid}:-0.1"),
+                InlineKeyboardButton(f"📈 OUT {ot:.2f}%", callback_data="noop"),
+                InlineKeyboardButton(f"+0.1", callback_data=f"adj_out:{sid}:+0.1"),
             ],
+            # Alerts + Pushover toggle
             [
-                InlineKeyboardButton("🔔 Toggle alerts", callback_data=f"toggle:{sid}"),
-                InlineKeyboardButton("📺 Terminal",       callback_data=f"terminal:{sid}"),
+                InlineKeyboardButton(al, callback_data=f"toggle:{sid}"),
+                InlineKeyboardButton(pu, callback_data=f"push_toggle:{sid}"),
             ],
-            [InlineKeyboardButton("🗑 Delete spread",    callback_data=f"del:{sid}")],
+            # Terminal + Delete
+            [
+                InlineKeyboardButton("📺 Terminal", callback_data=f"terminal:{sid}"),
+                InlineKeyboardButton("🗑 Delete",   callback_data=f"del:{sid}"),
+            ],
         ])
 
     async def _show_detail(self, q, cid: int, cfg: SpreadConfig) -> None:
@@ -700,13 +790,25 @@ class SpreadBot:
     async def _check(self, bot, cid, cfg, ss: SpreadSnapshot, rt, now) -> None:
         sid = cfg.spread_id
 
+        async def _fire(kind: str, ch: AlertChannelState, msg_text: str, push_title: str) -> None:
+            if now - ch.last_fired < ALERT_INTERVAL_S:
+                return
+            ch.last_fired = now
+            await _send_alert(bot, cid, cfg, ss, kind)
+            # Pushover
+            if cfg.pushover_on:
+                pk = await self.store.get_pushover_key(cid)
+                if pk:
+                    await self._send_pushover(pk, push_title, msg_text)
+
         # IN
         if ss.in_spread_pct is not None:
             ch = rt.channel(sid, "in")
             if ss.in_spread_pct >= cfg.in_threshold:
-                if now - ch.last_fired >= ALERT_INTERVAL_S:
-                    await _send_alert(bot, cid, cfg, ss, "IN")
-                    ch.last_fired = now
+                pct_s = f"{ss.in_spread_pct:+.3f}%"
+                await _fire("IN", ch,
+                    f"IN Spread: {pct_s}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
+                    f"🟢 ARB ENTRY {pct_s}")
             else:
                 ch.active = False
 
@@ -719,9 +821,10 @@ class SpreadBot:
                 db = ss.out_depth_b(OUT_DEPTH_RANGE_PCT)
                 depth_ok = da >= cfg.out_min_depth and db >= cfg.out_min_depth
             if ss.out_spread_pct >= cfg.out_threshold and depth_ok:
-                if now - ch.last_fired >= ALERT_INTERVAL_S:
-                    await _send_alert(bot, cid, cfg, ss, "OUT")
-                    ch.last_fired = now
+                pct_s = f"{ss.out_spread_pct:+.3f}%"
+                await _fire("OUT", ch,
+                    f"OUT Spread: {pct_s}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
+                    f"🔴 ARB EXIT {pct_s}")
             else:
                 ch.active = False
 
@@ -729,9 +832,10 @@ class SpreadBot:
         if ss.out_spread_pct is not None:
             ch = rt.channel(sid, "out_max")
             if ss.out_spread_pct >= cfg.out_max_threshold:
-                if now - ch.last_fired >= ALERT_INTERVAL_S:
-                    await _send_alert(bot, cid, cfg, ss, "OUT_MAX")
-                    ch.last_fired = now
+                pct_s = f"{ss.out_spread_pct:+.3f}%"
+                await _fire("OUT_MAX", ch,
+                    f"OUT MAX: {pct_s}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
+                    f"🔥 OUT MAX {pct_s}")
             else:
                 ch.active = False
 
@@ -741,9 +845,9 @@ class SpreadBot:
             ch = rt.channel(sid, "oi")
             max_oi = max(oi_vals)
             if max_oi >= cfg.oi_threshold:
-                if now - ch.last_fired >= ALERT_INTERVAL_S:
-                    await _send_oi_alert(bot, cid, cfg, max_oi)
-                    ch.last_fired = now
+                await _fire("OI", ch,
+                    f"OI: ${max_oi:,.0f}\n{cfg.leg_a.display} / {cfg.leg_b.display}",
+                    f"📊 OI Alert ${max_oi/1e6:.1f}M")
             else:
                 ch.active = False
 
@@ -867,6 +971,8 @@ def main() -> None:
     app.add_handler(CommandHandler("thresholds",     bot_core.cmd_thresholds))
     app.add_handler(CommandHandler("alerts_on",      bot_core.cmd_alerts_on))
     app.add_handler(CommandHandler("alerts_off",     bot_core.cmd_alerts_off))
+    app.add_handler(CommandHandler("set_pushover",   bot_core.cmd_set_pushover))
+    app.add_handler(CommandHandler("test_push",      bot_core.cmd_test_push))
     app.add_handler(CommandHandler("debug",          bot_core.cmd_debug))
     app.add_handler(CallbackQueryHandler(bot_core.cb_query))
 
