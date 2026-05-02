@@ -77,7 +77,7 @@ class JsonConfigStore(ConfigStore):
 
     async def load(self) -> dict[int, ChatConfig]:
         async with self._lock:
-            return await asyncio.get_event_loop().run_in_executor(None, self._load_sync)
+            return await asyncio.get_running_loop().run_in_executor(None, self._load_sync)
 
     def _load_sync(self) -> dict[int, ChatConfig]:
         if not os.path.exists(self.path):
@@ -106,7 +106,7 @@ class JsonConfigStore(ConfigStore):
 
     async def upsert(self, cfg: ChatConfig) -> None:
         async with self._lock:
-            await asyncio.get_event_loop().run_in_executor(None, self._upsert_sync, cfg)
+            await asyncio.get_running_loop().run_in_executor(None, self._upsert_sync, cfg)
 
     def _upsert_sync(self, cfg: ChatConfig) -> None:
         data: dict[str, Any] = {"chats": {}}
@@ -192,10 +192,12 @@ async def build_config_store() -> ConfigStore:
     if url:
         store = await RedisConfigStore.try_create(url)
         if store is not None:
-            log.info("config store: redis")
+            log.info("config store: Redis (%s)", url.split("@")[-1])
             return store
-    log.info("config store: config.json")
-    return JsonConfigStore("config.json")
+        log.warning("Redis unavailable — falling back to JSON (settings will reset on Railway restarts)")
+    data_path = os.getenv("DATA_PATH", "config.json")
+    log.info("config store: JSON at %s", os.path.abspath(data_path))
+    return JsonConfigStore(data_path)
 
 
 # ----------------------------------------------------------------- shared state
@@ -338,10 +340,10 @@ def fmt_status(snap: dict, cfg: ChatConfig) -> str:
         f"HyperLiq bid={_fmt_price(h['bid'])} ask={_fmt_price(h['ask'])} "
         f"fund={_fmt_funding(h['funding'])} OI={_fmt_oi(snap.get('hl_oi_usd'))} "
         f"{'STALE' if snap['hl_stale'] else 'LIVE'}\n"
-        f"Depth (-{OUT_DEPTH_RANGE_PCT}%): "
-        f"HL bids {PriceFeed.bid_depth_within_pct(snap.get('hl_bids', []), OUT_DEPTH_RANGE_PCT):.3f} | "
-        f"Gate asks {PriceFeed.ask_depth_within_pct(snap.get('gate_asks', []), OUT_DEPTH_RANGE_PCT):.3f} coins "
-        f"(min {cfg.out_min_depth})\n"
+        f"Out zone depth (-{OUT_DEPTH_RANGE_PCT}%): "
+        f"HL {PriceFeed.hl_out_depth(snap.get('hl_bids',[]), snap['gate']['ask'] or 0, OUT_DEPTH_RANGE_PCT):.3f} | "
+        f"Gate {PriceFeed.gate_out_depth(snap.get('gate_asks',[]), snap['hl']['bid'] or 0, OUT_DEPTH_RANGE_PCT):.3f} "
+        f"coins (min {cfg.out_min_depth})\n"
         f"\nIN  spread: {_fmt_pct(snap['in_spread_pct'])} ({_fmt_usd(snap['in_spread_usd'])})  "
         f"thr={cfg.in_threshold:.3f}%\n"
         f"OUT spread: {_fmt_pct(snap['out_spread_pct'])} ({_fmt_usd(snap['out_spread_usd'])})  "
@@ -591,9 +593,11 @@ async def alert_dispatcher(app: Application, feed: PriceFeed, state: BotState) -
             else:
                 rt.in_state.breached = False
 
-            # depth check — both HL bid side and Gate ask side must meet minimum
-            hl_depth = PriceFeed.bid_depth_within_pct(snap.get("hl_bids", []), OUT_DEPTH_RANGE_PCT)
-            gate_depth = PriceFeed.ask_depth_within_pct(snap.get("gate_asks", []), OUT_DEPTH_RANGE_PCT)
+            # depth: coins available within the -OUT_DEPTH_RANGE_PCT% exit spread zone
+            gate_ask = snap["gate"]["ask"] or 0.0
+            hl_bid   = snap["hl"]["bid"]   or 0.0
+            hl_depth   = PriceFeed.hl_out_depth(snap.get("hl_bids", []),   gate_ask, OUT_DEPTH_RANGE_PCT)
+            gate_depth = PriceFeed.gate_out_depth(snap.get("gate_asks", []), hl_bid,  OUT_DEPTH_RANGE_PCT)
             depth_ok = hl_depth >= rt.cfg.out_min_depth and gate_depth >= rt.cfg.out_min_depth
 
             # OUT spread (lower threshold) — only fires when both depth conditions met

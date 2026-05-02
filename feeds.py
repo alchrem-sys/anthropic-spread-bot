@@ -371,22 +371,24 @@ class PriceFeed:
     # ----------------------------------------------------------------- depth util
 
     @staticmethod
-    def bid_depth_within_pct(bids: list[dict], range_pct: float) -> float:
-        """Sum of bid sizes where price >= best_bid * (1 - range_pct/100)."""
-        if not bids:
+    def hl_out_depth(hl_bids: list[dict], gate_best_ask: float, range_pct: float) -> float:
+        """HL bid-side coins where exit spread >= -range_pct%.
+        Condition: hl_bid >= gate_ask * (1 - range_pct/100)
+        """
+        if not hl_bids or gate_best_ask <= 0:
             return 0.0
-        best = bids[0]["px"]
-        cutoff = best * (1.0 - range_pct / 100.0)
-        return sum(b["sz"] for b in bids if b["px"] >= cutoff)
+        cutoff = gate_best_ask * (1.0 - range_pct / 100.0)
+        return sum(b["sz"] for b in hl_bids if b["px"] >= cutoff)
 
     @staticmethod
-    def ask_depth_within_pct(asks: list[dict], range_pct: float) -> float:
-        """Sum of ask sizes where price <= best_ask * (1 + range_pct/100)."""
-        if not asks:
+    def gate_out_depth(gate_asks: list[dict], hl_best_bid: float, range_pct: float) -> float:
+        """Gate ask-side coins where exit spread >= -range_pct%.
+        Condition: gate_ask <= hl_bid / (1 - range_pct/100)
+        """
+        if not gate_asks or hl_best_bid <= 0:
             return 0.0
-        best = asks[0]["px"]
-        cutoff = best * (1.0 + range_pct / 100.0)
-        return sum(a["sz"] for a in asks if a["px"] <= cutoff)
+        cutoff = hl_best_bid / (1.0 - range_pct / 100.0)
+        return sum(a["sz"] for a in gate_asks if a["px"] <= cutoff)
 
     # ----------------------------------------------------------------- smoke test
 
