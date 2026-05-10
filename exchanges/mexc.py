@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from typing import Optional
 
@@ -31,6 +33,19 @@ class MEXCFutures(Exchange):
 
     def add_symbol(self, symbol: str) -> None:
         super().add_symbol(_mexc_futures_symbol(symbol))
+
+    def _ws_connect_kwargs(self) -> dict:
+        # Disable library-level pings; MEXC futures uses JSON ping/pong
+        return {"ping_interval": None, "ping_timeout": None}
+
+    async def _on_ws_msg(self, ws, msg: dict) -> None:
+        # MEXC futures sends {"channel": "pong"} or {"method": "ping"} keepalives
+        channel = msg.get("channel", "")
+        method = msg.get("method", "")
+        if channel == "ping" or method == "ping":
+            await ws.send(json.dumps({"method": "pong"}))
+        elif channel == "pong" or method == "pong":
+            pass  # already answered
 
     def _ws_url(self) -> str:
         return "wss://contract.mexc.com/edge"
