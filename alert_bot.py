@@ -58,14 +58,24 @@ ADMIN_IDS: set[int] = {int(x.strip()) for x in _admin_ids_raw.split(",") if x.st
 
 
 async def _is_subscribed(bot, user_id: int) -> bool:
-    """Return True if user is a subscriber of REQUIRED_CHANNEL."""
+    """Return True if user is a subscriber of REQUIRED_CHANNEL.
+    Returns True (fail-open) on any API error — bot may not be channel admin."""
     from telegram.error import BadRequest as TGBadRequest, NetworkError
     try:
         member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return member.status not in ("left", "kicked", "banned")
+        status = member.status
+        # Only block if we KNOW the user explicitly left/was kicked
+        if status in ("kicked", "banned"):
+            return False
+        # "left" means was a member and left — block
+        if status == "left":
+            return False
+        # "member", "administrator", "creator" → allow
+        return True
     except TGBadRequest:
-        # Never was a member → Telegram 400
-        return False
+        # Bot is likely not admin of the channel → can't check → fail-open
+        log.warning("Channel gate: bot not admin of %s, gate disabled", REQUIRED_CHANNEL)
+        return True
     except (NetworkError, Exception):
         return True  # fail-open for network / unknown errors
 
@@ -606,9 +616,18 @@ class SpreadBot:
 
     async def cb_query(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         q = u.callback_query
-        await q.answer()
+        try:
+            await q.answer()
+        except Exception:
+            pass
         cid = u.effective_chat.id
-        data: str = q.data
+        data: str = q.data or ""
+        try:
+            await self._cb_query_inner(u, c, q, cid, data)
+        except Exception as e:
+            log.exception("cb_query error for data=%r: %s", data, e)
+
+    async def _cb_query_inner(self, u, c, q, cid: int, data: str) -> None:
 
         if data == "newspread":
             await q.message.reply_text(
