@@ -55,14 +55,29 @@ class MEXCFutures(Exchange):
         return "wss://contract.mexc.com/edge"
 
     def _subscribe_msgs(self, symbol: str) -> list[dict]:
-        return [{"method": "sub.depth", "param": {"contract": symbol}}]
+        return [{"method": "sub.depth", "param": {"symbol": symbol}}]
 
     def _msg_symbol(self, msg: dict) -> Optional[str]:
+        # Try both "symbol" and "contract" keys
         data = msg.get("data") or {}
-        return data.get("contract") if isinstance(data, dict) else None
+        if isinstance(data, dict):
+            return data.get("symbol") or data.get("contract")
+        # Also check top-level "symbol" for subscription confirmations
+        return msg.get("symbol")
+
+    async def _on_ws_msg(self, ws, msg: dict) -> None:
+        # MEXC futures may send ping back — reply with pong
+        channel = msg.get("channel", "")
+        method = msg.get("method", "")
+        if channel == "ping" or method == "ping":
+            await ws.send(json.dumps({"method": "pong"}))
+        # Log subscription confirmation/errors for debugging
+        if msg.get("channel") == "rs.error" or msg.get("msg"):
+            self.log.warning("mexc ws msg: %s", msg)
 
     def _parse(self, msg: dict, state: dict) -> None:
-        if msg.get("channel") != "push.depth":
+        ch = msg.get("channel", "")
+        if ch != "push.depth":
             return
         data = msg.get("data") or {}
         if not isinstance(data, dict):
