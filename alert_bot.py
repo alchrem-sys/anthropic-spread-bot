@@ -1116,30 +1116,33 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", bot_core.conv_cancel)],
         per_message=False,
+        allow_reentry=True,
     )
 
     # Gate: runs before every handler — blocks non-subscribers
     app.add_handler(TypeHandler(Update, _gate_check), group=-1)
-    # "Check subscription" button — runs AFTER gate (gate lets check_sub pass)
-    app.add_handler(CallbackQueryHandler(_cb_check_sub, pattern=r"^check_sub$"), group=0)
 
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("start",          bot_core.cmd_start))
-    app.add_handler(CommandHandler("help",           bot_core.cmd_help))
-    app.add_handler(CommandHandler("spreads",        bot_core.cmd_spreads))
-    app.add_handler(CommandHandler("status",         bot_core.cmd_status))
-    app.add_handler(CommandHandler("set_in",         bot_core.cmd_set_in))
-    app.add_handler(CommandHandler("set_out",        bot_core.cmd_set_out))
-    app.add_handler(CommandHandler("set_outmax",     bot_core.cmd_set_outmax))
-    app.add_handler(CommandHandler("set_oi",         bot_core.cmd_set_oi))
-    app.add_handler(CommandHandler("set_out_depth",  bot_core.cmd_set_out_depth))
-    app.add_handler(CommandHandler("thresholds",     bot_core.cmd_thresholds))
-    app.add_handler(CommandHandler("alerts_on",      bot_core.cmd_alerts_on))
-    app.add_handler(CommandHandler("alerts_off",     bot_core.cmd_alerts_off))
-    app.add_handler(CommandHandler("set_pushover",   bot_core.cmd_set_pushover))
-    app.add_handler(CommandHandler("test_push",      bot_core.cmd_test_push))
-    app.add_handler(CommandHandler("debug",          bot_core.cmd_debug))
-    app.add_handler(CallbackQueryHandler(bot_core.cb_query))
+    # group 0: conversation flow + commands
+    app.add_handler(conv, group=0)
+    app.add_handler(CommandHandler("start",          bot_core.cmd_start), group=0)
+    app.add_handler(CommandHandler("help",           bot_core.cmd_help), group=0)
+    app.add_handler(CommandHandler("spreads",        bot_core.cmd_spreads), group=0)
+    app.add_handler(CommandHandler("status",         bot_core.cmd_status), group=0)
+    app.add_handler(CommandHandler("set_in",         bot_core.cmd_set_in), group=0)
+    app.add_handler(CommandHandler("set_out",        bot_core.cmd_set_out), group=0)
+    app.add_handler(CommandHandler("set_outmax",     bot_core.cmd_set_outmax), group=0)
+    app.add_handler(CommandHandler("set_oi",         bot_core.cmd_set_oi), group=0)
+    app.add_handler(CommandHandler("set_out_depth",  bot_core.cmd_set_out_depth), group=0)
+    app.add_handler(CommandHandler("thresholds",     bot_core.cmd_thresholds), group=0)
+    app.add_handler(CommandHandler("alerts_on",      bot_core.cmd_alerts_on), group=0)
+    app.add_handler(CommandHandler("alerts_off",     bot_core.cmd_alerts_off), group=0)
+    app.add_handler(CommandHandler("set_pushover",   bot_core.cmd_set_pushover), group=0)
+    app.add_handler(CommandHandler("test_push",      bot_core.cmd_test_push), group=0)
+    app.add_handler(CommandHandler("debug",          bot_core.cmd_debug), group=0)
+
+    # group 1: all callback queries — runs independently of ConversationHandler state
+    app.add_handler(CallbackQueryHandler(_cb_check_sub, pattern=r"^check_sub$"), group=1)
+    app.add_handler(CallbackQueryHandler(bot_core.cb_query), group=1)
 
     log.info("Bot starting…")
     app.run_polling(drop_pending_updates=True)   # synchronous — owns its own event loop
