@@ -123,33 +123,51 @@ class Exchange:
                         for msg in self._subscribe_msgs(sym):
                             await ws.send(__import__("json").dumps(msg))
                     backoff = RECONNECT_MIN_S
-                    while not self._stop.is_set():
-                        try:
-                            raw = await asyncio.wait_for(
-                                ws.recv(), timeout=WS_IDLE_TIMEOUT_S
-                            )
-                        except asyncio.TimeoutError:
-                            self.log.warning(
-                                "ws idle [%s]: no data for %.0fs, reconnecting",
-                                self.name, WS_IDLE_TIMEOUT_S,
-                            )
-                            break
-                        if self._stop.is_set():
-                            break
-                        try:
-                            msg = __import__("json").loads(raw)
-                        except Exception:
-                            continue
-                        await self._on_ws_msg(ws, msg)
-                        sym = self._msg_symbol(msg)
-                        if sym and sym in self._state:
-                            async with self._lock:
-                                self._parse(msg, self._state[sym])
-                        elif sym is None:
-                            # broadcast message — try all symbols
-                            async with self._lock:
-                                for st in self._state.values():
-                                    self._parse(msg, st)
+                    # Start optional keepalive task (e.g. MEXC needs active pings)
+                    keepalive_task = None
+                    keepalive_interval = self._ws_keepalive_interval()
+                    if keepalive_interval:
+                        async def _keepalive(ws=ws, interval=keepalive_interval):
+                            try:
+                                while True:
+                                    await asyncio.sleep(interval)
+                                    await self._ws_send_keepalive(ws)
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                pass
+                        keepalive_task = asyncio.create_task(_keepalive())
+                    try:
+                        while not self._stop.is_set():
+                            try:
+                                raw = await asyncio.wait_for(
+                                    ws.recv(), timeout=WS_IDLE_TIMEOUT_S
+                                )
+                            except asyncio.TimeoutError:
+                                self.log.warning(
+                                    "ws idle [%s]: no data for %.0fs, reconnecting",
+                                    self.name, WS_IDLE_TIMEOUT_S,
+                                )
+                                break
+                            if self._stop.is_set():
+                                break
+                            try:
+                                msg = __import__("json").loads(raw)
+                            except Exception:
+                                continue
+                            await self._on_ws_msg(ws, msg)
+                            sym = self._msg_symbol(msg)
+                            if sym and sym in self._state:
+                                async with self._lock:
+                                    self._parse(msg, self._state[sym])
+                            elif sym is None:
+                                # broadcast message — try all symbols
+                                async with self._lock:
+                                    for st in self._state.values():
+                                        self._parse(msg, st)
+                    finally:
+                        if keepalive_task:
+                            keepalive_task.cancel()
             except (ConnectionClosed, OSError, asyncio.TimeoutError) as e:
                 self.log.warning("ws disconnected [%s]: %s  (retry in %.0fs)",
                                  self.name, e, backoff)
@@ -212,6 +230,14 @@ class Exchange:
 
     async def _on_ws_msg(self, ws, msg: dict) -> None:
         """Hook called for every incoming WS message. Override for JSON ping/pong etc."""
+        pass
+
+    def _ws_keepalive_interval(self) -> Optional[float]:
+        """Return seconds between active keepalive pings, or None to disable."""
+        return None
+
+    async def _ws_send_keepalive(self, ws) -> None:
+        """Called every _ws_keepalive_interval() seconds. Override to send custom ping."""
         pass
 
     def _subscribe_msgs(self, symbol: str) -> list[dict]:

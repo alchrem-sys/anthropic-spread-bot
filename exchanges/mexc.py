@@ -38,14 +38,18 @@ class MEXCFutures(Exchange):
         # Disable library-level pings; MEXC futures uses JSON ping/pong
         return {"ping_interval": None, "ping_timeout": None}
 
+    def _ws_keepalive_interval(self):
+        return 15.0  # send ping every 15s so server doesn't close connection
+
+    async def _ws_send_keepalive(self, ws) -> None:
+        await ws.send(json.dumps({"method": "ping"}))
+
     async def _on_ws_msg(self, ws, msg: dict) -> None:
-        # MEXC futures sends {"channel": "pong"} or {"method": "ping"} keepalives
+        # MEXC futures may send ping back — reply with pong
         channel = msg.get("channel", "")
         method = msg.get("method", "")
         if channel == "ping" or method == "ping":
             await ws.send(json.dumps({"method": "pong"}))
-        elif channel == "pong" or method == "pong":
-            pass  # already answered
 
     def _ws_url(self) -> str:
         return "wss://contract.mexc.com/edge"
