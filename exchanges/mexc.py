@@ -41,7 +41,9 @@ class MEXCFutures(Exchange):
     market_type = "futures"
 
     def add_symbol(self, symbol: str) -> None:
-        super().add_symbol(_mexc_futures_symbol(symbol))
+        normalized = _mexc_futures_symbol(symbol)
+        self._sym_aliases[symbol] = normalized
+        super().add_symbol(normalized)
 
     # ── Override start(): no WS, only REST ticker polling ──
 

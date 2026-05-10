@@ -132,7 +132,7 @@ async def _cb_check_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             reply_markup=_GATE_KB,
         )
 
-ASK_LEG_A_EX, ASK_LEG_A_SYM, ASK_LEG_B_EX, ASK_LEG_B_SYM = range(4)
+ASK_TICKER, ASK_LEG_A_EX, ASK_LEG_B_EX = range(3)
 
 # ── exchange menu ──────────────────────────────────────────────────────────────
 _EXCHANGES = [
@@ -516,18 +516,27 @@ class SpreadBot:
 
     async def cmd_newspread(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
         await u.message.reply_text(
-            "📊 *Новий спред — Leg A (SHORT)*\nВибери біржу:",
+            "📊 *Новий спред*\n\nВведи тікер (наприклад `BARUSDT`):",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_ex_keyboard("leg_a"),
         )
-        return ASK_LEG_A_EX
+        return ASK_TICKER
 
     async def cmd_newspread_cb(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
         """Entry via inline button (➕ New spread)."""
         q = u.callback_query
         await q.answer()
         await q.message.reply_text(
-            "📊 *Новий спред — Leg A (SHORT)*\nВибери біржу:",
+            "📊 *Новий спред*\n\nВведи тікер (наприклад `BARUSDT`):",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ASK_TICKER
+
+    async def conv_ticker(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        """User entered the ticker — now pick exchange A (SHORT)."""
+        sym = u.message.text.strip().upper()
+        c.user_data["ticker"] = sym
+        await u.message.reply_text(
+            f"✅ Тікер: *{sym}*\n\n📊 *Leg A (SHORT)* — вибери біржу:",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=_ex_keyboard("leg_a"),
         )
@@ -539,22 +548,10 @@ class SpreadBot:
         _, exchange, market_type = q.data.split(":", 2)
         c.user_data["leg_a_ex"] = exchange
         c.user_data["leg_a_mt"] = market_type
-        hint = _SYM_HINT.get((exchange, market_type), "введи тікер")
+        sym = c.user_data["ticker"]
         label = next((lbl for lbl, ex, mt in _EXCHANGES if ex == exchange and mt == market_type), exchange)
         await q.edit_message_text(
-            f"✅ Leg A: *{label}*\n\nВведи тікер ({hint}):",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return ASK_LEG_A_SYM
-
-    async def conv_leg_a_sym(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
-        sym = u.message.text.strip().upper()
-        c.user_data["leg_a_sym"] = sym
-        exchange = c.user_data["leg_a_ex"]
-        market_type = c.user_data["leg_a_mt"]
-        label = next((lbl for lbl, ex, mt in _EXCHANGES if ex == exchange and mt == market_type), exchange)
-        await u.message.reply_text(
-            f"✅ Leg A: *{label} · {sym}*\n\n📊 *Leg B (LONG)* — вибери біржу:",
+            f"✅ Тікер: *{sym}*\n✅ Leg A: *{label}*\n\n📊 *Leg B (LONG)* — вибери біржу:",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=_ex_keyboard("leg_b"),
         )
@@ -566,20 +563,12 @@ class SpreadBot:
         _, exchange, market_type = q.data.split(":", 2)
         c.user_data["leg_b_ex"] = exchange
         c.user_data["leg_b_mt"] = market_type
-        hint = _SYM_HINT.get((exchange, market_type), "введи тікер")
-        label = next((lbl for lbl, ex, mt in _EXCHANGES if ex == exchange and mt == market_type), exchange)
-        await q.edit_message_text(
-            f"✅ Leg B: *{label}*\n\nВведи тікер ({hint}):",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return ASK_LEG_B_SYM
-
-    async def conv_leg_b_sym(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        # All done — create the spread
         cid = u.effective_chat.id
-        sym_b = u.message.text.strip().upper()
         ud = c.user_data
-        info_a = _make_info(ud["leg_a_ex"], ud["leg_a_mt"], ud["leg_a_sym"])
-        info_b = _make_info(ud["leg_b_ex"], ud["leg_b_mt"], sym_b)
+        sym = ud["ticker"]
+        info_a = _make_info(ud["leg_a_ex"], ud["leg_a_mt"], sym)
+        info_b = _make_info(ud["leg_b_ex"], ud["leg_b_mt"], sym)
         c.user_data.clear()
 
         sid = str(uuid.uuid4())[:8]
@@ -593,7 +582,7 @@ class SpreadBot:
         rt = self._rt(cid)
         rt.selected_spread_id = sid
         await self.store.set_selected_spread(cid, sid)
-        await u.message.reply_text(
+        await q.edit_message_text(
             f"✅ Спред додано!\n*{cfg.name}*\n\n"
             f"Пороги: IN {cfg.in_threshold}% | OUT {cfg.out_threshold}%\n"
             "Дивись /status",
@@ -1129,10 +1118,9 @@ def main() -> None:
             CallbackQueryHandler(bot_core.cmd_newspread_cb, pattern=r"^newspread$"),
         ],
         states={
+            ASK_TICKER:    [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_ticker)],
             ASK_LEG_A_EX:  [CallbackQueryHandler(bot_core.conv_leg_a_ex,  pattern=r"^leg_a:")],
-            ASK_LEG_A_SYM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_leg_a_sym)],
             ASK_LEG_B_EX:  [CallbackQueryHandler(bot_core.conv_leg_b_ex,  pattern=r"^leg_b:")],
-            ASK_LEG_B_SYM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_leg_b_sym)],
         },
         fallbacks=[CommandHandler("cancel", bot_core.conv_cancel)],
         per_message=False,

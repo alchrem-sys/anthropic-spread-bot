@@ -60,6 +60,7 @@ class Exchange:
         self._state: dict[str, dict] = {}   # symbol -> sym_state
         self._lock = asyncio.Lock()
         self._symbols: set[str] = set()
+        self._sym_aliases: dict[str, str] = {}  # original_sym -> normalized_sym
         self._ws: Any = None
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
@@ -93,8 +94,17 @@ class Exchange:
         self._symbols.add(symbol)
         if symbol not in self._state:
             self._state[symbol] = _empty_sym_state()
+        # Store mapping: original symbol -> normalized symbol for lookup
+        self._sym_aliases[symbol] = symbol
+
+    def _resolve_symbol(self, symbol: str) -> str:
+        """Resolve original symbol to the normalized one stored in _state."""
+        if symbol in self._state:
+            return symbol
+        return self._sym_aliases.get(symbol, symbol)
 
     def snapshot(self, symbol: str) -> Snapshot:
+        symbol = self._resolve_symbol(symbol)
         s = self._state.get(symbol) or _empty_sym_state()
         return Snapshot(
             bid=s["bid"], ask=s["ask"],

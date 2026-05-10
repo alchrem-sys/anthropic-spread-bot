@@ -36,7 +36,9 @@ class OKXFutures(Exchange):
     market_type = "futures"
 
     def add_symbol(self, symbol: str) -> None:
-        super().add_symbol(_okx_inst_id(symbol, futures=True))
+        normalized = _okx_inst_id(symbol, futures=True)
+        self._sym_aliases[symbol] = normalized
+        super().add_symbol(normalized)
 
     async def start(self, session: aiohttp.ClientSession) -> None:
         if self._tasks:
@@ -131,7 +133,9 @@ class OKXSpot(Exchange):
     market_type = "spot"
 
     def add_symbol(self, symbol: str) -> None:
-        super().add_symbol(_okx_inst_id(symbol, futures=False))
+        normalized = _okx_inst_id(symbol, futures=False)
+        self._sym_aliases[symbol] = normalized
+        super().add_symbol(normalized)
 
     def _ws_url(self) -> str:
         return _OKX_WS
