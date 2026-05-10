@@ -825,7 +825,14 @@ class SpreadBot:
                     bid = state.get("bid")
                     status = f"✅ {age:.1f}s bid={bid}"
                 lines.append(f"  sym `{sym}`: {status}")
-        await u.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        text = "\n".join(lines)
+        # Telegram message limit is 4096 chars; split if needed
+        for i in range(0, len(text), 4000):
+            chunk = text[i:i+4000]
+            try:
+                await u.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await u.message.reply_text(chunk)
 
     # ─── threshold setters
 
