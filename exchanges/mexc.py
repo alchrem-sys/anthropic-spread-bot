@@ -10,11 +10,27 @@ import aiohttp
 from .base import Exchange
 
 
+def _mexc_futures_symbol(symbol: str) -> str:
+    """Normalize to MEXC futures contract format: BARUSDT → BAR_USDT.
+    Already-formatted symbols (contain '_') are returned as-is.
+    """
+    if "_" in symbol:
+        return symbol
+    for quote in ("USDT", "USDC", "BTC", "ETH", "USD"):
+        if symbol.endswith(quote):
+            base = symbol[: -len(quote)]
+            return f"{base}_{quote}"
+    return symbol
+
+
 class MEXCFutures(Exchange):
     """MEXC USDT-margined perpetual futures."""
 
     name = "mexc"
     market_type = "futures"
+
+    def add_symbol(self, symbol: str) -> None:
+        super().add_symbol(_mexc_futures_symbol(symbol))
 
     def _ws_url(self) -> str:
         return "wss://contract.mexc.com/edge"
