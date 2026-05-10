@@ -522,6 +522,17 @@ class SpreadBot:
         )
         return ASK_LEG_A_EX
 
+    async def cmd_newspread_cb(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
+        """Entry via inline button (➕ New spread)."""
+        q = u.callback_query
+        await q.answer()
+        await q.message.reply_text(
+            "📊 *Новий спред — Leg A (SHORT)*\nВибери біржу:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_ex_keyboard("leg_a"),
+        )
+        return ASK_LEG_A_EX
+
     async def conv_leg_a_ex(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> int:
         q = u.callback_query
         await q.answer()
@@ -616,12 +627,15 @@ class SpreadBot:
 
     async def cb_query(self, u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         q = u.callback_query
+        data: str = q.data or ""
+        # Skip callbacks handled by ConversationHandler (group 0)
+        if data.startswith("leg_a:") or data.startswith("leg_b:") or data == "newspread":
+            return
         try:
             await q.answer()
         except Exception:
             pass
         cid = u.effective_chat.id
-        data: str = q.data or ""
         try:
             await self._cb_query_inner(u, c, q, cid, data)
         except Exception as e:
@@ -630,11 +644,7 @@ class SpreadBot:
     async def _cb_query_inner(self, u, c, q, cid: int, data: str) -> None:
 
         if data == "newspread":
-            await q.message.reply_text(
-                "📊 *Новий спред — Leg A (SHORT)*\nВибери біржу:",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=_ex_keyboard("leg_a"),
-            )
+            pass  # handled by ConversationHandler entry point
         elif data.startswith("sel:"):
             sid = data[4:]
             cfg = self._spreads.get(sid)
@@ -1107,7 +1117,10 @@ def main() -> None:
     )
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("newspread", bot_core.cmd_newspread)],
+        entry_points=[
+            CommandHandler("newspread", bot_core.cmd_newspread),
+            CallbackQueryHandler(bot_core.cmd_newspread_cb, pattern=r"^newspread$"),
+        ],
         states={
             ASK_LEG_A_EX:  [CallbackQueryHandler(bot_core.conv_leg_a_ex,  pattern=r"^leg_a:")],
             ASK_LEG_A_SYM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bot_core.conv_leg_a_sym)],
